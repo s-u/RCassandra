@@ -86,7 +86,7 @@ static int tc_abort(tconn_t *c, const char *reason) {
     if (c->s != -1)
 	close(c->s);
     c->s = -1;
-    fprintf(stderr, "* ERROR * tc_abort: %s\n", reason);
+    REprintf("tc_abort: %s\n", reason);
     return -1;
 }
 
@@ -254,6 +254,16 @@ static int64_t tc_read_i64(tconn_t *c) {
     return i;
 }
 
+static double tc_read_double(tconn_t *c) {
+    double d;
+    int j;
+    char *u = (char*) &d;
+    tc_read(c, 8);
+    /* FIXME: this assumes litte endianness */
+    for (j = 0; j < 8; j++) u[j] = c->recv_buf[7 - j];
+    return d;
+}
+
 static const char *tc_read_str(tconn_t *c) {
     int len = tc_read_i32(c);
     if (tc_ok(c) && tc_read(c, len) == len) {
@@ -290,6 +300,8 @@ enum {
   TType_SET    = 14, /* 0x0e */
   TType_LIST   = 15  /* 0x0f */
 };
+
+/* static const char *type_name[] = { "STOP", "void", "bool", "byte", "double", "#5", "i16", "#7", "i32", "#9", "i64", "string", "struct", "map", "set", "list" }; */
 
 #define VERSION_1    0x80010000
 #define VERSION_MASK 0xffff0000
@@ -453,6 +465,115 @@ static void tc_skip_fields(tconn_t *c) {
     }
 }
 
+/* --- vanilla R/Thrift type conversion - it is used only where we don't map things natively --- */
+
+static void tc_skip_fields(tconn_t *c);
+
+static SEXP tc_read_value(tconn_t *c, int type) {
+    switch (type) {
+    case TType_STOP:
+    case TType_VOID:
+	return R_NilValue;
+    case TType_BYTE:
+	return ScalarInteger(tc_read_u8(c));
+    case TType_BOOL:
+	return ScalarLogical(tc_read_u8(c));
+    case TType_DOUBLE:
+	return ScalarReal(tc_read_double(c));
+    case TType_I64:
+	return ScalarReal((double)tc_read_i64(c));
+    case TType_I16:
+	return ScalarInteger(tc_read_i16(c));
+    case TType_I32:
+	return ScalarInteger(tc_read_i32(c));
+    case TType_STRING:
+	{
+	    const char *cs = tc_read_str(c);
+	    return cs ? ScalarString(mkCharCE(cs, CE_UTF8)) : R_NilValue;
+	}
+    case TType_MAP:
+    case TType_SET:
+    case TType_LIST:
+	{
+	    int tk = (type == TType_MAP) ? tc_read_u8(c) : -1;
+	    int tv = tc_read_u8(c);
+	    int ct = tc_read_i32(c), i;
+	    SEXP res, nv = 0;
+	    switch (tv) {
+	    case TType_STRING:
+		res = PROTECT(allocVector(STRSXP, ct)); break;
+	    case TType_DOUBLE:
+	    case TType_I64:
+		res = PROTECT(allocVector(REALSXP, ct)); break;
+	    case TType_BYTE:
+	    case TType_I16:
+	    case TType_I32:
+		res = PROTECT(allocVector(INTSXP, ct)); break;
+	    case TType_BOOL:
+		res = PROTECT(allocVector(LGLSXP, ct)); break;
+	    default:
+		res = PROTECT(allocVector(VECSXP, ct)); break;
+	    }		
+	    if (type == TType_MAP) {
+		if (tk != TType_STRING)
+		    Rf_warning("Only strings are supported as map keys");
+		else
+		    setAttrib(res, R_NamesSymbol,(nv = allocVector(STRSXP, ct)));
+	    }
+	    for (i = 0; i < ct; i++) {
+		if (type == TType_MAP) {
+		    if (tk == TType_STRING) {
+			const char *cn = tc_read_str(c);
+			if (cn) SET_STRING_ELT(nv, i, mkCharCE(cn, CE_UTF8));
+		    } else
+			tc_skip_value(c, tk);
+		}
+		switch (tv) {
+		case TType_STRING: {
+		    const char *cs = tc_read_str(c);
+		    if (cs) SET_STRING_ELT(res, i, mkCharCE(cs, CE_UTF8));
+		    break;
+		}
+		case TType_DOUBLE:
+		    REAL(res)[i] = tc_read_double(c); break;
+		case TType_I64:
+		    REAL(res)[i] = (double) tc_read_i64(c); break;
+		case TType_BYTE:
+		case TType_BOOL:
+		    INTEGER(res)[i] = tc_read_u8(c); break;
+		case TType_I16:
+		    INTEGER(res)[i] = tc_read_i16(c); break;
+		case TType_I32:
+		    INTEGER(res)[i] = tc_read_i32(c); break;
+		default:
+		    SET_VECTOR_ELT(res, i, tc_read_value(c, tv));
+		}
+	    }
+	    UNPROTECT(1);
+	    return res;
+	}
+	break;
+    case TType_STRUCT: {
+	int ty;
+	SEXP head = PROTECT(CONS(R_NilValue, R_NilValue)), tail = head;
+	while (tc_ok(c) && ((ty = tc_read_u8(c)) != TType_STOP)) {
+	    int id = tc_read_i16(c);
+	    SEXP v = PROTECT(list1(tc_read_value(c, ty)));
+	    char ids[12];
+	    snprintf(ids, sizeof(ids), "%d", id);
+	    SET_TAG(v, install(ids));
+	    SETCDR((tail == R_NilValue) ? head : tail, v);
+	    tail = v;
+	    UNPROTECT(1);
+	}
+	UNPROTECT(1);
+	return CDR(head);
+	break;
+    }
+    }
+    return R_NilValue;
+}
+
 /* --- Cassandra --- */
 
 static char *string_msg(tconn_t *c, const char *msg) {
@@ -465,7 +586,9 @@ static char *string_msg(tconn_t *c, const char *msg) {
 	    const char *cn;
 	    char *s;
 	    cn = tc_read_str(c);
+#if RC_DEBUG
 	    fprintf(stderr, "INFO: msg '%s', type=%d, seq=%d: '%s'\n", m.name ? m.name : "<NULL>", m.type, m.seq, cn ? cn : "<NULL>");
+#endif
 	    s = strdup(cn);
 	    tc_skip_fields(c);
 	    return s;
@@ -571,7 +694,7 @@ static void RC_void_ex(tconn_t *c, int rest) {
     if (rest == TType_STRUCT) { /* exception */
 	int pt = tc_read_u8(c);
 	if (pt) {
-	    int id = tc_read_i16(c);
+	    /* int id = */ tc_read_i16(c);
 	    if (pt == TType_STRING) {
 		char err[256];
 		const char *es = tc_read_str(c);
@@ -639,89 +762,6 @@ SEXP RC_login(SEXP sc, SEXP user, SEXP pwd) {
     Rf_error("login error (unrecognized response)");
     return sc;
 }
-
-#if RC_DEBUG
-static SEXP RC_read_fields(tconn_t *c, int level);
-
-static const char *type_name[] = { "STOP", "void", "bool", "byte", "double", "#5", "i16", "#7", "i32", "#9", "i64", "string", "struct", "map", "set", "list" };
-
-static void read_value(tconn_t *c, int type, int level) {
-    switch (type) {
-    case TType_BYTE:
-	Rprintf("0x%02x", tc_read_u8(c));
-	break;
-    case TType_BOOL:
-	Rprintf((tc_read_u8(c) == 1) ? "TRUE" : "FALSE");
-	break;
-    case TType_DOUBLE: {
-	double d;
-	char *e = (char *)&d;
-	tc_read(c, 8);
-	{ int i; for (i = 7; i >= 0; i--) *(e++) = c->recv_buf[i]; }
-	Rprintf("%g", d);
-	break;
-    }
-    case TType_I16:
-	Rprintf("%d", tc_read_i16(c));
-	break;
-    case TType_I32:
-	Rprintf("%d", tc_read_i32(c));
-	break;
-    case TType_I64:
-	Rprintf("%ld", (long) tc_read_i64(c));
-	break;
-    case TType_STRING: {
-	const char *s = tc_read_str(c);
-	Rprintf("'%s'", s);
-	break;
-    }
-    case TType_MAP: {
-	int tk = tc_read_u8(c);
-	int tv = tc_read_u8(c);
-	int ct = tc_read_i32(c);
-	int i;
-	for (i = 0; i < ct; i++) {
-	    Rprintf("\n");
-	    { int i; for (i = 0; i < level; i++) Rprintf(" "); }
-	    read_value(c, tk, level); Rprintf(" -> ");
-	    read_value(c, tv, level);
-	}
-	break;
-    }
-    case TType_LIST: {
-	int ty = tc_read_u8(c);
-	int ct = tc_read_i32(c);
-	int i;
-	for (i = 0; i < ct; i++) {
-	    Rprintf("\n");
-	    { int i; for (i = 0; i < level; i++) Rprintf(" "); }
-	    read_value(c, ty, level);
-	}
-	break;
-    }	
-    case TType_STRUCT: {
-	Rprintf("\n");
-	RC_read_fields(c, level + 1);
-	break;
-    }
-    default:
-	Rprintf("<???>");
-    }
-}
-
-static SEXP RC_read_fields(tconn_t *c, int level) {
-    int type;
-    while (tc_ok(c) && (type = tc_read_u8(c)) != 0) {
-	int id = tc_read_i16(c);
-	{ int i; for (i = 0; i < level; i++) Rprintf(" "); }
-	Rprintf("%d) %d [%s]: ", id, type, (type < 16 && type >= 0) ? type_name[type] : "???");
-	read_value(c, type, level);
-	Rprintf("\n");
-    }
-    return R_NilValue;
-}
-
-#endif
 
 SEXP RC_get(SEXP sc, SEXP key, SEXP cf, SEXP col) {
     ConsistencyLevel cl = ONE;
@@ -1016,6 +1056,66 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
 	} else RC_void_ex(c, m.rest); /* otherwise check for exceptions and bail out */
     }
     Rf_error("failed to get result");
+    return R_NilValue;
+}
+
+
+SEXP RC_describe_splits(SEXP sc, SEXP cf, SEXP s_tok, SEXP e_tok, SEXP nKeys) {
+    msg_t m;
+    tconn_t *c;
+
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    if (TYPEOF(s_tok) != STRSXP || TYPEOF(e_tok) != STRSXP || LENGTH(s_tok) != 1 || LENGTH(e_tok) != 1) Rf_error("token must be a character vector of length one");
+    if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
+    c = (tconn_t*) EXTPTR_PTR(sc);
+    tc_write_msg(c, "describe_splits", TMessageType_CALL, c->seq++);
+    tc_write_fstr(c, 1, R2UTF8(cf));
+    tc_write_fstr(c, 2, R2UTF8(s_tok));
+    tc_write_fstr(c, 3, R2UTF8(e_tok));
+    tc_write_field(c, TType_I32, 4); tc_write_i32(c, asInteger(nKeys));
+    tc_write_stop(c);
+    tc_flush(c);
+    if (tc_read_msg(c, &m) && m.rest) {
+	SEXP res = tc_read_value(c, m.rest);
+	tc_skip_fields(c);
+	return res;
+    }
+    return R_NilValue;    
+}
+
+SEXP RC_describe_ring(SEXP sc, SEXP ks) {
+    msg_t m;
+    tconn_t *c;
+
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    if (TYPEOF(ks) != STRSXP || LENGTH(ks) != 1) Rf_error("keyspace family must be a character vector of length one");
+    c = (tconn_t*) EXTPTR_PTR(sc);
+    tc_write_msg(c, "describe_ring", TMessageType_CALL, c->seq++);
+    tc_write_fstr(c, 1, R2UTF8(ks));
+    tc_write_stop(c);
+    tc_flush(c);
+    if (tc_read_msg(c, &m) && m.rest) {
+	SEXP res = tc_read_value(c, m.rest);
+	tc_skip_fields(c);
+	return res;
+    }
+    return R_NilValue;    
+}
+
+SEXP RC_call_void(SEXP sc, SEXP method) {
+    msg_t m;
+    tconn_t *c;
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    if (TYPEOF(method) != STRSXP || LENGTH(method) != 1) Rf_error("method must be a character vector of length one");
+    c = (tconn_t*) EXTPTR_PTR(sc);
+    tc_write_msg(c, R2UTF8(method), TMessageType_CALL, c->seq++);
+    tc_write_stop(c);
+    tc_flush(c);
+    if (tc_read_msg(c, &m) && m.rest) {
+	SEXP res = tc_read_value(c, m.rest);
+	tc_skip_fields(c);
+	return res;
+    }
     return R_NilValue;
 }
 

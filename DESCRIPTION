@@ -1,0 +1,10 @@
+Package: RCassandra
+Version: 0.1-0
+Title: R/Cassandra interface
+Author: Simon Urbanek <simon.urbanek@r-project.org>
+Maintainer: Simon Urbanek <simon.urbanek@r-project.org>
+Description: This packages provides a direct interface (without the
+	     use of Java) to the most basic functionality of Apache
+	     Cassanda such as login, updates and queries.
+License: GPL-2
+URL: http://www.rforge.net/RCassandra

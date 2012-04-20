@@ -24,9 +24,22 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/time.h>
 
 #define USE_RINTERNALS
 #include <Rinternals.h>
+
+/* we want to set CL per connection so we (ab)use the conn strcture for it */
+typedef enum ConsistencyLevel {
+    ONE = 1,
+    QUORUM = 2,
+    LOCAL_QUORUM = 3,
+    EACH_QUORUM = 4,
+    ALL = 5,
+    ANY = 6,
+    TWO = 7,
+    THREE = 8,
+} ConsistencyLevel;
 
 typedef struct tconn {
     int s, seq;
@@ -34,6 +47,7 @@ typedef struct tconn {
     unsigned int recv_len, recv_alloc, recv_next;
     int recv_frame;
     char *send_buf, *recv_buf, *recv_buf0, next_char;
+    ConsistencyLevel cl;
 } tconn_t;
 
 #define tc_ok(X) (((X)->s) != -1)
@@ -46,6 +60,7 @@ static tconn_t *tc_connect(const char *host, int port) {
     c->send_alloc = 65536;
     c->send_len = 0;
     c->next_char = 0;
+    c->cl = ONE;
     c->send_buf = (char*) malloc(c->send_alloc);
     if (!c->send_buf) { free(c); return 0; }
     c->recv_alloc = 65536;
@@ -322,6 +337,19 @@ static void tc_write_i16(tconn_t *c, short i) {
 static void tc_write_i32(tconn_t *c, int i) {
     if (c->send_len + 4 > c->send_alloc)
 	tc_flush(c);
+    c->send_buf[c->send_len++] = (i >> 24) & 255;
+    c->send_buf[c->send_len++] = (i >> 16) & 255;
+    c->send_buf[c->send_len++] = (i >> 8) & 255;
+    c->send_buf[c->send_len++] = i & 255;    
+}
+
+static void tc_write_i64(tconn_t *c, int64_t i) {
+    if (c->send_len + 4 > c->send_alloc)
+	tc_flush(c);
+    c->send_buf[c->send_len++] = (i >> 56) & 255;
+    c->send_buf[c->send_len++] = (i >> 48) & 255;
+    c->send_buf[c->send_len++] = (i >> 40) & 255;
+    c->send_buf[c->send_len++] = (i >> 32) & 255;    
     c->send_buf[c->send_len++] = (i >> 24) & 255;
     c->send_buf[c->send_len++] = (i >> 16) & 255;
     c->send_buf[c->send_len++] = (i >> 8) & 255;
@@ -605,17 +633,6 @@ static char *string_msg(tconn_t *c, const char *msg) {
 #define describe_cluster_name(C) string_msg(C, "describe_cluster_name")
 #define describe_version(C) string_msg(C, "describe_version")
 
-typedef enum ConsistencyLevel {
-    ONE = 1,
-    QUORUM = 2,
-    LOCAL_QUORUM = 3,
-    EACH_QUORUM = 4,
-    ALL = 5,
-    ANY = 6,
-    TWO = 7,
-    THREE = 8,
-} ConsistencyLevel;
-
 
 /* --- R API -- */
 
@@ -764,7 +781,6 @@ SEXP RC_login(SEXP sc, SEXP user, SEXP pwd) {
 }
 
 SEXP RC_get(SEXP sc, SEXP key, SEXP cf, SEXP col) {
-    ConsistencyLevel cl = ONE;
     msg_t m;
     tconn_t *c;
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
@@ -781,7 +797,7 @@ SEXP RC_get(SEXP sc, SEXP key, SEXP cf, SEXP col) {
     tc_write_stop(c);
     /* consistency level */
     tc_write_field(c, TType_I32, 3);
-    tc_write_i32(c, cl);
+    tc_write_i32(c, c->cl);
     tc_write_stop(c);
     tc_flush(c);
     if (tc_read_msg(c, &m)) {
@@ -853,7 +869,6 @@ static SEXP list_result(tconn_t *c, int fin_call) {
 }
 
 SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev) {
-    ConsistencyLevel cl = ONE;
     msg_t m;
     tconn_t *c;
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
@@ -881,7 +896,54 @@ SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit,
     tc_write_stop(c); /* SP */
     /* consistency level */
     tc_write_field(c, TType_I32, 3);
-    tc_write_i32(c, cl);
+    tc_write_i32(c, c->cl);
+    tc_write_stop(c);
+    tc_flush(c);
+    if (tc_read_msg(c, &m)) {
+	if (m.rest == TType_STOP)
+	    Rf_error("missing result object from Cassandra");
+	if (m.rest == TType_LIST) { /* the result should be a list */
+	    SEXP res = list_result(c, 1);
+	    if (res != R_NilValue)
+		return res;
+	} else { /* not a list - skip it and raise an error */
+	    RC_void_ex(c, m.rest);
+	    Rf_error("invalid result type (%d)", m.rest);
+	}	
+	tc_skip_fields(c); /* this is for the call result struct */
+    }
+    Rf_error("error obtaining result");
+    return R_NilValue;
+}
+
+SEXP RC_get_list(SEXP sc, SEXP key, SEXP cf, SEXP cols, SEXP limit, SEXP rev) {
+    msg_t m;
+    tconn_t *c;
+    int n, i;
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
+    if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
+    if (TYPEOF(cols) != STRSXP) Rf_error("columns must be a character vector");
+    n = LENGTH(cols);
+    c = (tconn_t*) EXTPTR_PTR(sc);
+
+    tc_write_msg(c, "get_slice", TMessageType_CALL, c->seq++);
+    tc_write_fstr(c, 1, R2UTF8(key)); /* key */
+    /* ColumnParent */
+    tc_write_field(c, TType_STRUCT, 2);
+    tc_write_fstr(c, 3, R2UTF8(cf));
+    tc_write_stop(c);
+    /* SlicePredicate */
+    tc_write_field(c, TType_STRUCT, 3);
+    /* column names list */
+    tc_write_field(c, TType_LIST, 1);
+    tc_write_u8(c, TType_STRING);
+    tc_write_i16(c, n);
+    for (i = 0; i < n; i++) tc_write_str(c, translateCharUTF8(STRING_ELT(cols, i)));
+    tc_write_stop(c); /* SP */
+    /* consistency level */
+    tc_write_field(c, TType_I32, 3);
+    tc_write_i32(c, c->cl);
     tc_write_stop(c);
     tc_flush(c);
     if (tc_read_msg(c, &m)) {
@@ -902,7 +964,6 @@ SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit,
 }
 
 SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev) {
-    ConsistencyLevel cl = ONE;
     int i;
     msg_t m;
     tconn_t *c;
@@ -934,7 +995,7 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
     tc_write_stop(c); /* SP */
     /* consistency level */
     tc_write_field(c, TType_I32, 3);
-    tc_write_i32(c, cl);
+    tc_write_i32(c, c->cl);
     tc_write_stop(c);
     tc_flush(c);
     if (tc_read_msg(c, &m)) {
@@ -973,7 +1034,6 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
 }
 
 SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP k_lim, SEXP k_tok) {
-    ConsistencyLevel cl = ONE;
     msg_t m;
     tconn_t *c;
     int col_lim = asInteger(limit);
@@ -1012,7 +1072,7 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
     tc_write_stop(c); /* KR */    
     /* consistency level */
     tc_write_field(c, TType_I32, 4);
-    tc_write_i32(c, cl);
+    tc_write_i32(c, c->cl);
     tc_write_stop(c);
     tc_flush(c);
     if (tc_read_msg(c, &m)) {
@@ -1083,6 +1143,133 @@ SEXP RC_describe_splits(SEXP sc, SEXP cf, SEXP s_tok, SEXP e_tok, SEXP nKeys) {
     return R_NilValue;    
 }
 
+static int64_t now() {
+    int64_t v;
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+    v = tv.tv_sec;
+    v *= 1000000;
+    v += tv.tv_usec;
+    return v;
+}
+
+SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val) {
+    msg_t m;
+    tconn_t *c;
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
+    if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
+    if (TYPEOF(col) != STRSXP || LENGTH(col) != 1) Rf_error("column must be a character vector of length one");
+    if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("value must be a character vector of length one or NULL");
+    c = (tconn_t*) EXTPTR_PTR(sc);
+
+    tc_write_msg(c, "insert", TMessageType_CALL, c->seq++);
+    tc_write_fstr(c, 1, R2UTF8(key)); /* key */
+    /* ColumnParent */
+    tc_write_field(c, TType_STRUCT, 2);
+    tc_write_fstr(c, 3, R2UTF8(cf));
+    tc_write_stop(c);
+    /* Column */
+    tc_write_field(c, TType_STRUCT, 3);
+    tc_write_fstr(c, 1, R2UTF8(col));
+    if (val != R_NilValue) tc_write_fstr(c, 2, R2UTF8(val));
+    tc_write_field(c, TType_I64, 3); tc_write_i64(c, now());
+    tc_write_stop(c); /* Col */
+    /* consistency level */
+    tc_write_field(c, TType_I32, 3);
+    tc_write_i32(c, c->cl);
+    tc_write_stop(c);
+    tc_flush(c);
+
+    if (tc_read_msg(c, &m)) {
+	RC_void_ex(c, m.rest);
+	return sc;
+    }
+    Rf_error("error obtaining result");
+    return R_NilValue;
+}
+
+/* mutation = list(c.family=list(row.key=list(col=value, ...))) */
+SEXP RC_mutate(SEXP sc, SEXP mut) {
+    msg_t m;
+    tconn_t *c;
+    int cfs, i, j;
+    SEXP cfn;
+    int64_t now_ts;
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    cfn = getAttrib(mut, R_NamesSymbol);
+    if (TYPEOF(mut) != VECSXP || TYPEOF(cfn) != STRSXP) Rf_error("Invalid mutation");
+    c = (tconn_t*) EXTPTR_PTR(sc);
+    now_ts = now();
+
+    tc_write_msg(c, "batch_mutate", TMessageType_CALL, c->seq++);
+    tc_write_field(c, TType_MAP, 1); /* mutation */
+    tc_write_u8(c, TType_STRING);
+    tc_write_u8(c, TType_MAP);
+    tc_write_i32(c, cfs = LENGTH(mut));
+    for (i = 0; i < cfs; i++) {
+	SEXP rk = VECTOR_ELT(mut, i);
+	SEXP rn = getAttrib(rk, R_NamesSymbol);
+	int nr = LENGTH(rk);
+	if (TYPEOF(rk) != VECSXP || TYPEOF(rn) != STRSXP) {
+	    close(c->s);
+	    c->s = -1;
+	    Rf_error("invalid key list in the mutation, aborting connection");
+	}
+	tc_write_str(c, translateCharUTF8(STRING_ELT(cfn, i)));
+	tc_write_u8(c, TType_STRING);
+	tc_write_u8(c, TType_LIST);
+	tc_write_i32(c, nr);
+	for (j = 0; j < nr; j++) {
+	    SEXP cl = VECTOR_ELT(rk, j), cn = getAttrib(cl, R_NamesSymbol);
+	    int nc = LENGTH(cl);
+	    tc_write_str(c, translateCharUTF8(STRING_ELT(rn, j)));
+	    tc_write_u8(c, TType_STRUCT); /* Mutation */
+	    if (TYPEOF(cl) == STRSXP || (TYPEOF(cl) == VECSXP && TYPEOF(cn) == STRSXP)) {
+		int k;
+		tc_write_i32(c, nc);
+		for (k = 0; k < nc; k++) {
+		    tc_write_field(c, TType_STRUCT, 1); /* CoSC */
+		    tc_write_field(c, TType_STRUCT, 1); /* Colunn */
+		    if (TYPEOF(cl) == STRSXP) {
+			if (TYPEOF(cn) != STRSXP)
+			    tc_write_fstr(c, 1, translateCharUTF8(STRING_ELT(cl, k)));
+			else {
+			    tc_write_fstr(c, 1, translateCharUTF8(STRING_ELT(cn, k)));
+			    tc_write_fstr(c, 2, translateCharUTF8(STRING_ELT(cl, k)));
+			}
+		    } else {
+			SEXP v = VECTOR_ELT(cl, k);
+			if (TYPEOF(v) != STRSXP) {
+			    v = eval(PROTECT(lang2(install("as.character"), v)), R_GlobalEnv);
+			    UNPROTECT(1);
+			}
+			tc_write_fstr(c, 1, translateCharUTF8(STRING_ELT(cn, k)));
+			tc_write_fstr(c, 2, R2UTF8(v));
+		    }
+		    tc_write_field(c, TType_I64, 3); tc_write_i64(c, now_ts);
+		    tc_write_stop(c); /* Col */
+		    tc_write_stop(c); /* CoSC */
+		    tc_write_stop(c); /* Mut */
+		}
+	    } else {
+		close(c->s);
+		c->s = -1;
+		Rf_error("invalid columt list in the mutation, aborting connection");
+	    }
+	}
+    }
+    tc_write_stop(c);
+    tc_flush(c);
+
+    if (tc_read_msg(c, &m)) {
+	RC_void_ex(c, m.rest);
+	return sc;
+    }
+    Rf_error("error obtaining result");
+    return R_NilValue;
+}
+
 SEXP RC_describe_ring(SEXP sc, SEXP ks) {
     msg_t m;
     tconn_t *c;
@@ -1118,6 +1305,15 @@ SEXP RC_call_void(SEXP sc, SEXP method) {
     }
     return R_NilValue;
 }
+
+SEXP RC_set_cl(SEXP sc, SEXP cl) {
+    tconn_t *c;
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    c = (tconn_t*) EXTPTR_PTR(sc);
+    c->cl = (ConsistencyLevel) asInteger(cl);
+    return sc;
+}
+
 
 /* short-circuit dispatch on [[ for data frames */
 SEXP R_get_col(SEXP df, SEXP i) {

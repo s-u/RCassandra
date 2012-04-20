@@ -19,11 +19,18 @@
 #include <string.h>
 
 #include <sys/types.h>
+#ifdef WIN32
+#include <windows.h>
+#include <winsock2.h>
+static int wsock_up = 0;
+#else
+#define closesocket(C) close(C)
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <unistd.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#endif
+#include <unistd.h>
 #include <sys/time.h>
 
 #define USE_RINTERNALS
@@ -54,6 +61,14 @@ typedef struct tconn {
 
 static tconn_t *tc_connect(const char *host, int port) {
     tconn_t *c = (tconn_t*) malloc(sizeof(tconn_t));
+#ifdef WIN32
+    if (!wsock_up) {
+	 WSADATA dt;
+	 /* initialize WinSock 1.1 */
+	 WSAStartup(0x0101, &dt);
+	 wsock_up = 1;
+    }
+#endif
     c->s = -1;
     c->seq = 0;
     c->recv_frame = -1;
@@ -74,17 +89,34 @@ static tconn_t *tc_connect(const char *host, int port) {
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(port);
 	if (host) {
-	    if (inet_pton(sin.sin_family, host, &sin.sin_addr) != 1) { /* invalid, try DNS */
+#ifdef WIN32
+	    int al = sizeof(sin);
+	    if (WSAStringToAddress((LPSTR)host, sin.sin_family, 0, (struct sockaddr*)&sin, &al) != 0) {
 		if (!(haddr = gethostbyname(host))) { /* DNS failed, */
-		    close(c->s);
+		    closesocket(c->s);
 		    c->s = -1;
 		}
 		sin.sin_addr.s_addr = *((uint32_t*) haddr->h_addr); /* pick first address */
 	    }
+	    /* for some reason Windows trashes the structure so we need to fill it again */
+	    sin.sin_family = AF_INET;
+	    sin.sin_port = htons(port);
+#else
+	    if (inet_pton(sin.sin_family, host, &sin.sin_addr) != 1) { /* invalid, try DNS */
+		if (!(haddr = gethostbyname(host))) { /* DNS failed, */
+		    closesocket(c->s);
+		    c->s = -1;
+		}
+		sin.sin_addr.s_addr = *((uint32_t*) haddr->h_addr); /* pick first address */
+	    }
+#endif
 	} else
 	    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	if (c->s != -1 && connect(c->s, (struct sockaddr*)&sin, sizeof(sin))) {
-	    close(c->s);
+#ifdef WIN32
+	    Rprintf("WSAGetLastError = %d\n", WSAGetLastError());
+#endif
+	    closesocket(c->s);
 	    c->s = -1;
 	}
     }
@@ -99,7 +131,7 @@ static tconn_t *tc_connect(const char *host, int port) {
 
 static int tc_abort(tconn_t *c, const char *reason) {
     if (c->s != -1)
-	close(c->s);
+	closesocket(c->s);
     c->s = -1;
     REprintf("tc_abort: %s\n", reason);
     return -1;
@@ -138,7 +170,7 @@ static void tc_close(tconn_t *c) {
     if (!c) return;
     if (c->s != -1) {
 	tc_flush(c);
-	close(c->s);
+	closesocket(c->s);
     }
     free(c->send_buf);
     free(c->recv_buf0);
@@ -643,20 +675,20 @@ static void tconn_fin(SEXP what) {
     if (c) tc_close(c);
 }
 
-SEXP RC_connect(SEXP s_host, SEXP s_port) {
-    int port = asInteger(s_port);
+SEXP RC_connect(SEXP sHost, SEXP sPort) {
+    int port = asInteger(sPort);
     const char *host;
     tconn_t *c;
     SEXP res;
 
     if (port < 1 || port > 65534)
 	Rf_error("Invalid port number");
-    if (s_host == R_NilValue)
+    if (sHost == R_NilValue)
 	host = "127.0.0.1";
     else {
-	if (TYPEOF(s_host) != STRSXP || LENGTH(s_host) != 1)
+	if (TYPEOF(sHost) != STRSXP || LENGTH(sHost) != 1)
 	    Rf_error("host must be a character vector of length one");
-	host = translateCharUTF8(STRING_ELT(s_host, 0));
+	host = R2UTF8(sHost);
     }
     c = tc_connect(host, port);
     if (!c)
@@ -673,7 +705,7 @@ SEXP RC_close(SEXP sc) {
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     c = (tconn_t*) EXTPTR_PTR(sc);
     /* we can't use tc_close because it frees the connection object */
-    close(c->s);
+    closesocket(c->s);
     c->s = -1;
     return R_NilValue;
 }
@@ -1212,7 +1244,7 @@ SEXP RC_mutate(SEXP sc, SEXP mut) {
 	SEXP rn = getAttrib(rk, R_NamesSymbol);
 	int nr = LENGTH(rk);
 	if (TYPEOF(rk) != VECSXP || TYPEOF(rn) != STRSXP) {
-	    close(c->s);
+	    closesocket(c->s);
 	    c->s = -1;
 	    Rf_error("invalid key list in the mutation, aborting connection");
 	}
@@ -1253,7 +1285,7 @@ SEXP RC_mutate(SEXP sc, SEXP mut) {
 		    tc_write_stop(c); /* Mut */
 		}
 	    } else {
-		close(c->s);
+		closesocket(c->s);
 		c->s = -1;
 		Rf_error("invalid columt list in the mutation, aborting connection");
 	    }

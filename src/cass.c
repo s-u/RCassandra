@@ -1065,10 +1065,11 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
     return R_NilValue;
 }
 
-SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP k_lim, SEXP k_tok) {
+SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP k_lim, SEXP k_tok, SEXP sFixed) {
     msg_t m;
     tconn_t *c;
     int col_lim = asInteger(limit);
+    int fixed = asInteger(sFixed) == 1;
 
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key_f) != STRSXP || TYPEOF(key_l) != STRSXP || LENGTH(key_f) != 1 || LENGTH(key_l) != 1) Rf_error("start/end key must be a character vector of length one");
@@ -1120,24 +1121,104 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
 		tc_skip_fields(c); /* call struct */
 		Rf_error("Invalid value type (%d) instead of KeySlice", tv);
 	    }
-	    res = PROTECT(allocVector(VECSXP, ct));
-	    nv = allocVector(STRSXP, ct);
-	    setAttrib(res, R_NamesSymbol, nv);
-	    for (i = 0; i < ct; i++) {
-		int ft;
-		while (tc_ok(c) && (ft = tc_read_u8(c)) != TType_STOP) {
-		    int fi = tc_read_i16(c);
-		    if (fi == 1 && ft == TType_STRING) { /* key */
-			const char *ns = tc_read_str(c);
-			if (ns) SET_STRING_ELT(nv, i, mkCharCE(ns, CE_UTF8));
-		    } else if (fi == 2 && ft == TType_LIST) { /* list of columns */
-			if (col_lim == 0) /* for flat return don't bother converting the payload */
-			    tc_skip_value(c, ft);
-			else
-			    SET_VECTOR_ELT(res, i, list_result(c, 0));
-		    } else {
-			inv = 1;
-			tc_skip_value(c, fi);
+	    if (fixed) {
+		SEXP cols = R_NilValue, ctail = cols;
+		SEXP rnv = PROTECT(allocVector(STRSXP, ct)), cnv, res;
+		int nc = 0;
+		for (i = 0; i < ct; i++) {
+		    int ft;
+		    while (tc_ok(c) && (ft = tc_read_u8(c)) != TType_STOP) {
+			int fi = tc_read_i16(c);
+			if (fi == 1 && ft == TType_STRING) { /* key */
+			    const char *rns = tc_read_str(c);
+			    if (rns) SET_STRING_ELT(rnv, i, mkCharCE(rns, CE_UTF8));
+			} else if (fi == 2 && ft == TType_LIST) { /* list of columns */
+			    int vt = tc_read_u8(c);
+			    int j, n = tc_read_i32(c);
+			    if (tc_ok(c) && vt == TType_STRUCT && n >= 0) {
+				for (j = 0; j < n; j++) {
+				    int pt = tc_read_u8(c);
+				    SEXP cv = 0;
+				    tc_read_i16(c); /* id */
+				    /* printf(" -- %d) %d\n", i + 1, pt); */
+				    if (pt == TType_STRUCT) {
+					while ((pt = tc_read_u8(c)) && tc_ok(c)) {
+					    int pd = tc_read_i16(c);
+					    /* printf(" -- %d) type=%d, id=%d\n", i + 1, pt, pd); */
+					    if (pt == TType_STRING) {
+						const char *cc = tc_read_str(c);
+						if (cc) {
+						    if (pd == 1) { /* column name */
+							SEXP cs = cols;
+							while (cs != R_NilValue) {
+							    if (!strcmp(CHAR(TAG(cs)), cc)) break;
+							    cs = CDR(cs);
+							}
+							if (cs == R_NilValue) { /* new column vector */
+							    cv = allocVector(STRSXP, ct);
+							    if (cols == R_NilValue) {
+								ctail = cols = list1(cv);
+								PROTECT(cols);
+								SET_TAG(cols, mkCharCE(cc, CE_UTF8));
+							    } else {
+								SEXP newc = list1(cv);
+								SETCDR(ctail, newc);
+								SET_TAG(newc, mkCharCE(cc, CE_UTF8));
+								ctail = newc;
+							    }
+							    nc++;
+							} else cv = CAR(cs);
+						    } else if (pd == 2 && cv) /* value */
+							SET_STRING_ELT(cv, i, mkCharCE(cc, CE_UTF8));
+						}
+					    } else tc_skip_value(c, pt);
+					}
+				    } else
+					tc_skip_value(c, pt);
+				    tc_skip_fields(c); /* end of the struct in the list */
+				}
+			    } else if (tc_ok(c) && n > 0) { /* non-struct payload, skip */
+				for (j = 0; j < n; j++)
+				    tc_skip_value(c, vt);
+			    }
+			} else {
+			    inv = 1;
+			    tc_skip_value(c, fi);
+			}
+		    }
+		}
+		res = PROTECT(allocVector(VECSXP, nc));
+		setAttrib(res, R_RowNamesSymbol, rnv);
+		setAttrib(res, R_NamesSymbol, (cnv = allocVector(STRSXP, nc)));
+		for (i = 0; i < nc; i++) {
+		    if (TAG(cols) != R_NilValue)
+			SET_STRING_ELT(cnv, i, TAG(cols));
+		    SET_VECTOR_ELT(res, i, CAR(cols));
+		    cols = CDR(cols);
+		}
+		setAttrib(res, R_ClassSymbol, mkString("data.frame"));
+		UNPROTECT(nc ? 3 : 2);
+		return res;
+	    } else {
+		res = PROTECT(allocVector(VECSXP, ct));
+		nv = allocVector(STRSXP, ct);
+		setAttrib(res, R_NamesSymbol, nv);
+		for (i = 0; i < ct; i++) {
+		    int ft;
+		    while (tc_ok(c) && (ft = tc_read_u8(c)) != TType_STOP) {
+			int fi = tc_read_i16(c);
+			if (fi == 1 && ft == TType_STRING) { /* key */
+			    const char *ns = tc_read_str(c);
+			    if (ns) SET_STRING_ELT(nv, i, mkCharCE(ns, CE_UTF8));
+			} else if (fi == 2 && ft == TType_LIST) { /* list of columns */
+			    if (col_lim == 0) /* for flat return don't bother converting the payload */
+				tc_skip_value(c, ft);
+			    else
+				SET_VECTOR_ELT(res, i, list_result(c, 0));
+			} else {
+			    inv = 1;
+			    tc_skip_value(c, fi);
+			}
 		    }
 		}
 	    }
@@ -1289,6 +1370,75 @@ SEXP RC_mutate(SEXP sc, SEXP mut) {
 		c->s = -1;
 		Rf_error("invalid columt list in the mutation, aborting connection");
 	    }
+	}
+    }
+    tc_write_stop(c);
+    tc_flush(c);
+
+    if (tc_read_msg(c, &m)) {
+	RC_void_ex(c, m.rest);
+	return sc;
+    }
+    Rf_error("error obtaining result");
+    return R_NilValue;
+}
+
+SEXP RC_write_table(SEXP sc, SEXP cf, SEXP df, SEXP rn, SEXP cn) {
+    msg_t m;
+    tconn_t *c;
+    int64_t now_ts;
+    int i, j, nc, nr, conv = 0;
+    const char *cfn;
+
+    if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
+    if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a string");
+    if (TYPEOF(df) != VECSXP) Rf_error("The object to write must be a data.frame");
+    if (TYPEOF(rn) != STRSXP || TYPEOF(cn) != STRSXP) Rf_error("Both row names and column names must exist and be character vectors");
+    cfn = R2UTF8(cf);
+    nc = LENGTH(df);
+    if (nc == 0 || (nr = LENGTH(VECTOR_ELT(df, 0))) == 0)
+	Rf_error("empty data.frame, nothing to do");
+    /* check whether we need to convert any column to character */
+    for (i = 0; i < nc; i++) if (TYPEOF(VECTOR_ELT(df, i)) != STRSXP) { conv = 1; break; }
+    if (conv) { /* call as.character on all non-character columns */
+	SEXP ndf = PROTECT(allocVector(VECSXP, nc));
+	SEXP ac = install("as.character");
+	for (i = 0; i < nc; i++) {
+	    if (TYPEOF(VECTOR_ELT(df, i)) != STRSXP) {
+		SET_VECTOR_ELT(ndf, i, eval(PROTECT(lang2(ac, VECTOR_ELT(df, i))), R_GlobalEnv));
+		UNPROTECT(1);
+	    } else
+		SET_VECTOR_ELT(ndf, i, VECTOR_ELT(df, i));
+	}
+	df = ndf;
+    }
+    
+    c = (tconn_t*) EXTPTR_PTR(sc);
+    now_ts = now();
+
+    tc_write_msg(c, "batch_mutate", TMessageType_CALL, c->seq++);
+    tc_write_field(c, TType_MAP, 1); /* mutation */
+    tc_write_u8(c, TType_STRING);
+    tc_write_u8(c, TType_MAP);
+    tc_write_i32(c, nr);
+    for (i = 0; i < nr; i++) {
+	tc_write_str(c, translateCharUTF8(STRING_ELT(rn, i)));
+	tc_write_u8(c, TType_STRING);
+	tc_write_u8(c, TType_LIST);
+	tc_write_i32(c, 1); /* map of 1 entry - cf */
+	tc_write_str(c, cfn);
+	/* list of mutations */
+	tc_write_u8(c, TType_STRUCT); /* list<Mutation> */
+	tc_write_i32(c, nc);
+	for (j = 0; j < nc; j++) {
+	    tc_write_field(c, TType_STRUCT, 1); /* CoSC */
+	    tc_write_field(c, TType_STRUCT, 1); /* Colunn */
+	    tc_write_fstr(c, 1, translateCharUTF8(STRING_ELT(cn, j)));
+	    tc_write_fstr(c, 2, translateCharUTF8(STRING_ELT(VECTOR_ELT(df, j), i)));
+	    tc_write_field(c, TType_I64, 3); tc_write_i64(c, now_ts);
+	    tc_write_stop(c); /* Col */
+	    tc_write_stop(c); /* CoSC */
+	    tc_write_stop(c); /* Mut */
 	}
     }
     tc_write_stop(c);

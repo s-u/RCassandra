@@ -4,6 +4,7 @@
 \alias{RC.get.range}
 \alias{RC.mget.range}
 \alias{RC.get.range.slices}
+\alias{RC.consistency}
 \title{
   Functions for querying Cassandra database
 }
@@ -20,6 +21,9 @@
 
   \code{RC.get.range.slices} queries a range of keys (or tokens) and a
   range of columns
+
+  \code{RC.consistency} sets the desired consistency level for all query
+  operations
 }
 \usage{
 RC.use(conn, key.space)
@@ -31,7 +35,9 @@ RC.mget.range(conn, c.family, keys, first = "", last = "",
 RC.get.range.slices(conn, c.family, k.start = "", k.end = "",
                     first = "", last = "", reverse = FALSE,
                     limit = 1e+07, k.limit = 1e+07,
-                    tokens = FALSE)
+                    tokens = FALSE, fixed = FALSE)
+RC.consistency(conn, level = c("one", "quorum", "local.quorum",
+               "each.quorum", "all", "any", "two", "three")) 
 }
 \arguments{
   \item{conn}{connection handle as returned by \code{\link{RC.connect}}}
@@ -49,9 +55,14 @@ RC.get.range.slices(conn, c.family, k.start = "", k.end = "",
   \item{k.limit}{return at most as many keys (rows)}
   \item{tokens}{if \code{TRUE} then keys are interpreted as tokens
     (i.e. values after hashing)}
+  \item{fixed}{if \code{TRUE} then the result if be a single data frame
+    consisting of rows and keys and all columns ever encountered -
+    essentially assuming fixed column structure}
+  \item{level}{the desired consistency level for query operations on
+  this connection. \code{"one"} is the default if not explicitly set.}
 }
 \value{
-  \code{RC.use} returns \code{conn}
+  \code{RC.use} and \code{RC.consistency} returns \code{conn}
   
   \code{RC.get} returns nothing useful :P
 
@@ -61,7 +72,9 @@ RC.get.range.slices(conn, c.family, k.start = "", k.end = "",
 
   \code{RC.mget.range} and  \code{RC.get.range.slices} return a named
   list of data frames as described in \code{RC.get.range} with names
-  being the row keys.
+  being the row keys, except if \code{fixed=TRUE} in which case the
+  result is a data frame with row names as keys and values as elements
+  (timestamps are not retrieved in that case).
 }
 \details{The nomenclature can be a bit confusing and it comes from the
   literature and the Cassandra API. Put in simple terms, \emph{keyspace}
@@ -88,7 +101,10 @@ RC.get.range.slices(conn, c.family, k.start = "", k.end = "",
 
   The result of queries may be also counter-intuitive, especially when
   querying fixed column tables as it is not returned in the form that
-  would be expected from a relational database. But you have to keep in
+  would be expected from a relational database. See
+  \code{\link{RC.read.table}} and \code{\link{RC.write.table}} for
+  retrieving and storing relational structures in rectangular tables
+  (column families with fixed columns). But you have to keep in
   mind that Cassandra is essentailly key/key/value storage (row key,
   column key, value) with partitioning on row keys and sorting of column
   keys, so designing the correct schema for a task needs some
@@ -102,7 +118,7 @@ RC.get.range.slices(conn, c.family, k.start = "", k.end = "",
 %\note{
 %}
 \seealso{
-  \code{\link{RC.connect}}
+  \code{\link{RC.connect}}, \code{\link{RC.read.table}}, \code{\link{RC.write.table}}
 }
 %\examples{
 %}

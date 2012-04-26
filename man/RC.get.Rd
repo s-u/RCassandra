@@ -28,7 +28,7 @@
 \usage{
 RC.use(conn, key.space)
 RC.get(conn, c.family, key, c.name,
-       comparator = NULL, validator = NULL
+       comparator = NULL, validator = NULL)
 RC.get.range(conn, c.family, key, first = "", last = "",
              reverse = FALSE, limit = 1e+07,
              comparator = NULL, validator = NULL)

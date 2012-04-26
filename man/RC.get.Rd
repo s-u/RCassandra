@@ -27,15 +27,19 @@
 }
 \usage{
 RC.use(conn, key.space)
-RC.get(conn, c.family, key, c.name)
+RC.get(conn, c.family, key, c.name,
+       comparator = NULL, validator = NULL
 RC.get.range(conn, c.family, key, first = "", last = "",
-             reverse = FALSE, limit = 1e+07)
+             reverse = FALSE, limit = 1e+07,
+             comparator = NULL, validator = NULL)
 RC.mget.range(conn, c.family, keys, first = "", last = "",
-             reverse = FALSE, limit = 1e+07)
+             reverse = FALSE, limit = 1e+07,
+             comparator = NULL, validator = NULL)
 RC.get.range.slices(conn, c.family, k.start = "", k.end = "",
                     first = "", last = "", reverse = FALSE,
                     limit = 1e+07, k.limit = 1e+07,
-                    tokens = FALSE, fixed = FALSE)
+                    tokens = FALSE, fixed = FALSE,
+                    comparator = NULL, validator = NULL)
 RC.consistency(conn, level = c("one", "quorum", "local.quorum",
                "each.quorum", "all", "any", "two", "three")) 
 }
@@ -45,6 +49,8 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
   \item{c.family}{column family (aka table) name}
   \item{key}{row key}
   \item{c.name}{column name}
+  \item{comparator}{string, type of the column keys (comparator in Cassandra speak) or NULL if no conversion is required}
+  \item{validator}{string, type of the values (validator in Cassandra speak) or NULL if no conversion is required}
   \item{first}{starting column name}
   \item{last}{ending column name}
   \item{reverse}{if \code{TRUE} the resutl is returned in reverse order}
@@ -88,6 +94,23 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
   (\code{RC.get.rnage.slices}), then selecting the columns of
   interest. Empty string (\code{""}) can be used to denote an
   unspecified range (so the default is to fetch all columns).
+
+  \code{comparator} and \code{validator} specify the types of column
+  keys and values respectively. Every key or value in Cassandra is
+  simply a byte string, so it can deal with arbitrary values, but
+  sometimes it is convenient to impose some structure on that content
+  by declaring what is represented by that byte string. Unfortunately
+  Cassandra does not include that information in the results, so the
+  user has to define how column names and values are to be
+  interpreted. The default interpretation is simply as a UTF-8 encoded
+  string, but RCassandra also supports following conversions:
+  "LongType" (8-bytes integer, stored as real vector in R), "DateType"
+  (8-bytes integer, stored as \code{POSIXct} in R), "BooleanType" (one
+  byte, logical vector in R), "FloatType" (4-bytes float, real vector
+  in R), "DoubleType" (8-bytes float, real vector in R). Currently
+  "UTF8Type", "AsciiType" and "BytesType" are all treated as
+  unconverted value (stored as character vector). No other conversions
+  are supported at this point.
 
   Cassandra collects results in memory so key (\code{k.limit}) and
   column (\code{limit}) limits are mandatory. Future versions of

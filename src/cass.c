@@ -64,8 +64,8 @@ static tconn_t *tc_connect(const char *host, int port) {
 #ifdef WIN32
     if (!wsock_up) {
 	 WSADATA dt;
-	 /* initialize WinSock 1.1 */
-	 WSAStartup(0x0101, &dt);
+	 /* initialize WinSock 2.0 (WSAStringToAddress is 2.0 feature) */
+	 WSAStartup(0x0200, &dt);
 	 wsock_up = 1;
     }
 #endif
@@ -113,9 +113,6 @@ static tconn_t *tc_connect(const char *host, int port) {
 	} else
 	    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	if (c->s != -1 && connect(c->s, (struct sockaddr*)&sin, sizeof(sin))) {
-#ifdef WIN32
-	    Rprintf("WSAGetLastError = %d\n", WSAGetLastError());
-#endif
 	    closesocket(c->s);
 	    c->s = -1;
 	}
@@ -296,8 +293,11 @@ static int64_t tc_read_i64(tconn_t *c) {
     int j;
     char *u = (char*) &i;
     tc_read(c, 8);
-    /* FIXME: this assumes litte endianness */
+#ifdef NATIVE_ORDER
+    memcpy(u, c->recv_buf, 8);
+#else
     for (j = 0; j < 8; j++) u[j] = c->recv_buf[7 - j];
+#endif
     return i;
 }
 
@@ -842,10 +842,97 @@ SEXP RC_get(SEXP sc, SEXP key, SEXP cf, SEXP col) {
     return sc;
 }
 
+typedef struct type_map {
+    const char *name;
+    SEXPTYPE  r_type;
+    int       size;
+} type_map_t;
+
+static const type_map_t type_map[] = {
+#define CT_UTF8  0
+    { "UTF8Type", STRSXP, 0 },
+#define CT_ASCII 1
+    { "AsciiType", STRSXP, 0 },
+#define CT_BYTES 2
+    { "BytesType", STRSXP, 0 }, /* FIXME: this is not true */
+#define CT_CONVERT 3 /* below this are direct types */
+#define CT_LONG  3
+    { "LongType",  REALSXP, 8 },
+#define CT_DATE  4
+    { "DateType",  REALSXP, 8 },
+#define CT_BOOL  5
+    { "BooleanType", LGLSXP, 1 },
+#define CT_FLOAT 6
+    { "FloatType", REALSXP, 4 },
+#define CT_DOUBLE 7
+    { "DoubleType", REALSXP, 8 },
+    { 0 }
+};
+
+static int get_type(const char *name) {
+    const type_map_t *tm = type_map;
+    int i = 0;
+    while (tm[i].name) {
+	if (!strcmp(name, tm[i].name)) return i;
+	i++;
+    }
+    return -1;
+}
+
+static int64_t mem_i64(const char *v) {
+    int64_t iv;
+    char *g = (char*) &iv;
+#ifdef NATIVE_ORDER
+    memcpy(g, v, 8);
+#else
+    int i;
+    for (i = 0; i < 8; i++) g[i] = v[7 - i];
+#endif
+    return iv;
+}
+
+static double mem_double(const char *v) {
+    double dv;
+    char *g = (char*) &dv;
+#ifdef NATIVE_ORDER
+    memcpy(g, v, 8);
+#else
+    int i;
+    for (i = 0; i < 8; i++) g[i] = v[7 - i];
+#endif
+    return dv;
+}
+
+static void setTypedElement(SEXP v, int index, const char *val, int type) {
+    switch (type) {
+    case CT_LONG:
+    case CT_DATE:
+	REAL(v)[index] = (double) mem_i64(val); break;
+    case CT_FLOAT:
+	{
+	    float f;
+	    char *c = (char*)&f;
+#ifdef NATIVE_ORDER
+	    memcpy(c, val, 4);
+#else
+	    c[0] = val[3]; c[1] = val[2]; c[2] = val[1]; c[3] = val[0];
+#endif
+	    REAL(v)[index] = (double) f;
+	    break;
+	}
+    case CT_DOUBLE:
+	REAL(v)[index] = mem_double(val);
+	break;
+    case CT_BOOL:
+	INTEGER(v)[index] = *val ? 1 : 0;
+	break;
+    }
+}
+
 /* read list payload of a result -- either a data frame of R_NilValue
    if fin_call == 0 then it only reads the list, otherwise it skips outof the struct/call containing the list
 */
-static SEXP list_result(tconn_t *c, int fin_call) {
+static SEXP list_result(tconn_t *c, int fin_call, int comp_type, int val_type) {
     int vt = tc_read_u8(c);
     int i, n = tc_read_i32(c);
 #ifdef RC_DEBUG
@@ -855,8 +942,8 @@ static SEXP list_result(tconn_t *c, int fin_call) {
 	SEXP sk, sv, st, rnv, res;
 	double *ts;
 	PROTECT(res = mkNamed(VECSXP, (const char *[]) { "key", "value", "ts", "" }));
-	SET_VECTOR_ELT(res, 0, (sk = allocVector(STRSXP, n)));
-	SET_VECTOR_ELT(res, 1, (sv = allocVector(STRSXP, n)));
+	SET_VECTOR_ELT(res, 0, (sk = allocVector(type_map[comp_type].r_type, n)));
+	SET_VECTOR_ELT(res, 1, (sv = allocVector(type_map[val_type].r_type, n)));
 	ts = REAL(SET_VECTOR_ELT(res, 2, (st = allocVector(REALSXP, n))));
 	rnv = allocVector(INTSXP, 2);
 	INTEGER(rnv)[0] = NA_INTEGER;
@@ -874,10 +961,17 @@ static SEXP list_result(tconn_t *c, int fin_call) {
 		    if (pt == TType_STRING) {
 			const char *cc = tc_read_str(c);
 			if (cc) {
-			    if (pd == 1)
-				SET_STRING_ELT(sk, i, mkCharCE(cc, CE_UTF8));
-			    else if (pd == 2)
-				SET_STRING_ELT(sv, i, mkCharCE(cc, CE_UTF8));
+			    if (pd == 1) { /* key */
+				if (comp_type < CT_CONVERT)
+				    SET_STRING_ELT(sk, i, mkCharCE(cc, CE_UTF8));
+				else
+				    setTypedElement(sk, i, cc, comp_type);
+			    } else if (pd == 2) { /* value */
+				if (val_type < CT_CONVERT)
+				    SET_STRING_ELT(sv, i, mkCharCE(cc, CE_UTF8));
+				else 
+				    setTypedElement(sv, i, cc, val_type);
+			    }
 			}
 		    } else if (pt == TType_I64) {
 			int64_t v = tc_read_i64(c);
@@ -900,14 +994,21 @@ static SEXP list_result(tconn_t *c, int fin_call) {
     return R_NilValue;
 }
 
-SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev) {
+SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP comp, SEXP val) {
     msg_t m;
     tconn_t *c;
+    int comp_type = 0, val_type = 0;
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
     if (TYPEOF(first) != STRSXP || LENGTH(first) != 1) Rf_error("column must be a character vector of length one");
     if (TYPEOF(last) != STRSXP || LENGTH(last) != 1) Rf_error("column must be a character vector of length one");
+    if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
+    if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
+    if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
+    if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("validator must be NULL or a string");
+    if (val != R_NilValue) val_type = get_type(CHAR(STRING_ELT(val, 0)));
+    if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
     c = (tconn_t*) EXTPTR_PTR(sc);
 
     tc_write_msg(c, "get_slice", TMessageType_CALL, c->seq++);
@@ -935,7 +1036,7 @@ SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit,
 	if (m.rest == TType_STOP)
 	    Rf_error("missing result object from Cassandra");
 	if (m.rest == TType_LIST) { /* the result should be a list */
-	    SEXP res = list_result(c, 1);
+	    SEXP res = list_result(c, 1, comp_type, val_type);
 	    if (res != R_NilValue)
 		return res;
 	} else { /* not a list - skip it and raise an error */
@@ -948,14 +1049,21 @@ SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit,
     return R_NilValue;
 }
 
-SEXP RC_get_list(SEXP sc, SEXP key, SEXP cf, SEXP cols, SEXP limit, SEXP rev) {
+SEXP RC_get_list(SEXP sc, SEXP key, SEXP cf, SEXP cols, SEXP limit, SEXP rev, SEXP comp, SEXP val) {
     msg_t m;
     tconn_t *c;
-    int n, i;
+    int n, i, comp_type = 0, val_type = 0;
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
     if (TYPEOF(cols) != STRSXP) Rf_error("columns must be a character vector");
+    if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
+    if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
+    if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
+    if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("validator must be NULL or a string");
+    if (val != R_NilValue) val_type = get_type(CHAR(STRING_ELT(val, 0)));
+    if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
+
     n = LENGTH(cols);
     c = (tconn_t*) EXTPTR_PTR(sc);
 
@@ -982,7 +1090,7 @@ SEXP RC_get_list(SEXP sc, SEXP key, SEXP cf, SEXP cols, SEXP limit, SEXP rev) {
 	if (m.rest == TType_STOP)
 	    Rf_error("missing result object from Cassandra");
 	if (m.rest == TType_LIST) { /* the result should be a list */
-	    SEXP res = list_result(c, 1);
+	    SEXP res = list_result(c, 1, comp_type, val_type);
 	    if (res != R_NilValue)
 		return res;
 	} else { /* not a list - skip it and raise an error */
@@ -995,8 +1103,8 @@ SEXP RC_get_list(SEXP sc, SEXP key, SEXP cf, SEXP cols, SEXP limit, SEXP rev) {
     return R_NilValue;
 }
 
-SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev) {
-    int i;
+SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP comp, SEXP val) {
+    int i, comp_type = 0, val_type = 0;
     msg_t m;
     tconn_t *c;
 
@@ -1005,6 +1113,12 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
     if (TYPEOF(first) != STRSXP || LENGTH(first) != 1) Rf_error("column must be a character vector of length one");
     if (TYPEOF(last) != STRSXP || LENGTH(last) != 1) Rf_error("column must be a character vector of length one");
+    if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
+    if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
+    if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
+    if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("validator must be NULL or a string");
+    if (val != R_NilValue) val_type = get_type(CHAR(STRING_ELT(val, 0)));
+    if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
     c = (tconn_t*) EXTPTR_PTR(sc);
     tc_write_msg(c, "multiget_slice", TMessageType_CALL, c->seq++);
     tc_write_field(c, TType_LIST, 1);
@@ -1054,7 +1168,7 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
 	    for (i = 0; i < ct; i++) {
 		const char *ns = tc_read_str(c);
 		if (ns) SET_STRING_ELT(nv, i, mkCharCE(ns, CE_UTF8));
-		SET_VECTOR_ELT(res, i, list_result(c, 0));
+		SET_VECTOR_ELT(res, i, list_result(c, 0, comp_type, val_type));
 	    }
 	    tc_skip_fields(c);
 	    UNPROTECT(1);
@@ -1065,10 +1179,10 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
     return R_NilValue;
 }
 
-SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP k_lim, SEXP k_tok, SEXP sFixed) {
+SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, SEXP last, SEXP limit, SEXP rev, SEXP k_lim, SEXP k_tok, SEXP sFixed, SEXP comp, SEXP val) {
     msg_t m;
     tconn_t *c;
-    int col_lim = asInteger(limit);
+    int col_lim = asInteger(limit), comp_type = 0, val_type = 0;
     int fixed = asInteger(sFixed) == 1;
 
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
@@ -1076,6 +1190,12 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
     if (TYPEOF(first) != STRSXP || LENGTH(first) != 1) Rf_error("column must be a character vector of length one");
     if (TYPEOF(last) != STRSXP || LENGTH(last) != 1) Rf_error("column must be a character vector of length one");
+    if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
+    if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
+    if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
+    if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("validator must be NULL or a string");
+    if (val != R_NilValue) val_type = get_type(CHAR(STRING_ELT(val, 0)));
+    if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
     c = (tconn_t*) EXTPTR_PTR(sc);
     tc_write_msg(c, "get_range_slices", TMessageType_CALL, c->seq++);
     /* ColumnParent */
@@ -1214,7 +1334,7 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
 			    if (col_lim == 0) /* for flat return don't bother converting the payload */
 				tc_skip_value(c, ft);
 			    else
-				SET_VECTOR_ELT(res, i, list_result(c, 0));
+				SET_VECTOR_ELT(res, i, list_result(c, 0, comp_type, val_type));
 			} else {
 			    inv = 1;
 			    tc_skip_value(c, fi);

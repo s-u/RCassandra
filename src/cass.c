@@ -1709,14 +1709,15 @@ SEXP RC_write_table(SEXP sc, SEXP cf, SEXP df, SEXP rn, SEXP cn) {
     return R_NilValue;
 }
 
-SEXP RC_describe_ring(SEXP sc, SEXP ks) {
+SEXP RC_call_ks(SEXP sc, SEXP method, SEXP ks) {
     msg_t m;
     tconn_t *c;
 
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
-    if (TYPEOF(ks) != STRSXP || LENGTH(ks) != 1) Rf_error("keyspace family must be a character vector of length one");
+    if (TYPEOF(method) != STRSXP || LENGTH(method) != 1) Rf_error("method must be a character vector of length one");
+    if (TYPEOF(ks) != STRSXP || LENGTH(ks) != 1) Rf_error("keyspace must be a character vector of length one");
     c = (tconn_t*) EXTPTR_PTR(sc);
-    tc_write_msg(c, "describe_ring", TMessageType_CALL, c->seq++);
+    tc_write_msg(c, R2UTF8(method), TMessageType_CALL, c->seq++);
     tc_write_fstr(c, 1, R2UTF8(ks));
     tc_write_stop(c);
     tc_flush(c);

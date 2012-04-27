@@ -26,7 +26,7 @@
   operations
 }
 \usage{
-RC.use(conn, key.space)
+RC.use(conn, keyspace, cache.def = TRUE)
 RC.get(conn, c.family, key, c.name,
        comparator = NULL, validator = NULL)
 RC.get.range(conn, c.family, key, first = "", last = "",
@@ -45,12 +45,18 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
 }
 \arguments{
   \item{conn}{connection handle as returned by \code{\link{RC.connect}}}
-  \item{key.space}{name of the keyspace to use}
+  \item{keyspace}{name of the keyspace to use}
+  \item{cache.def}{if \code{TRUE} then in addition to setting the
+    keyspace a query on the keyspace definition is sent and the result
+    cached. This allows automatic detection of comparators and
+    validators, see details section for more information.}
   \item{c.family}{column family (aka table) name}
   \item{key}{row key}
   \item{c.name}{column name}
-  \item{comparator}{string, type of the column keys (comparator in Cassandra speak) or NULL if no conversion is required}
-  \item{validator}{string, type of the values (validator in Cassandra speak) or NULL if no conversion is required}
+  \item{comparator}{string, type of the column keys (comparator in
+    Cassandra speak) or NULL to rely on cached schema definitions}
+  \item{validator}{string, type of the values (validator in Cassandra
+    speak) or NULL to rely on cached schema definitions}
   \item{first}{starting column name}
   \item{last}{ending column name}
   \item{reverse}{if \code{TRUE} the resutl is returned in reverse order}
@@ -70,7 +76,7 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
 \value{
   \code{RC.use} and \code{RC.consistency} returns \code{conn}
   
-  \code{RC.get} returns nothing useful :P
+  \code{RC.get} returns nothing useful at this point :P
 
   \code{RC.get.range} returns a data frame with columns \code{key}
   (column name), \code{value} (value in that column) and \code{ts}
@@ -104,14 +110,33 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
   user has to define how column names and values are to be
   interpreted. The default interpretation is simply as a UTF-8 encoded
   string, but RCassandra also supports following conversions:
+  "UTF8Type", "AsciiType" (stored as character vectors), "BytesType"
+  (opaque stream of bytes, stored as raw vector),
   "LongType" (8-bytes integer, stored as real vector in R), "DateType"
   (8-bytes integer, stored as \code{POSIXct} in R), "BooleanType" (one
   byte, logical vector in R), "FloatType" (4-bytes float, real vector
-  in R), "DoubleType" (8-bytes float, real vector in R). Currently
-  "UTF8Type", "AsciiType" and "BytesType" are all treated as
-  unconverted value (stored as character vector). No other conversions
-  are supported at this point.
+  in R), "DoubleType" (8-bytes float, real vector in R) and "UUIDType"
+  (16-bytes, stored as UUID-formatted string). No other conversions
+  are supported at this point. If the value is \code{NULL} then
+  \code{RCassandra} attempts to guess the proper value by taking into
+  account the schema definition obtained by
+  \code{RC.use(..., cache.def=TRUE)}, otherwise it falls back to
+  "UTF8Type". You can always get the raw form using "BytesType" and
+  decode the values in R.
 
+  The \code{comparator} also determines how the values of \code{first}
+  and \code{last} will be interpreted. Regardless of the comparator, it
+  is always possible to pass either \code{NULL}, \code{""} (both
+  denoting 0-length value) or a raw vector. Other supported types must
+  match the comparator.
+
+  Most users will be happy with the default settings, but if you want to
+  save every nanosecond you can, call
+  \code{RC.use(..., cache.def = FALSE)} (which saves one extra
+  \code{\link{RC.describe.keyspace}} request to the Cassandra instance)
+  and always specify both \code{comparator} and \code{validator} (even
+  if it is just "UTF8String").
+  
   Cassandra collects results in memory so key (\code{k.limit}) and
   column (\code{limit}) limits are mandatory. Future versions of
   RCassandra may abstract this limitation out (by using a limit and

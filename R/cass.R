@@ -12,7 +12,7 @@ RC.mget.range <- function(conn, c.family, keys, first="", last="", reverse=FALSE
 
 RC.get.range.slices <- function(conn, c.family, k.start="", k.end="", first="", last="", reverse=FALSE, limit=1e7, k.limit=1e7, tokens=FALSE, fixed=FALSE, comparator=NULL, validator=NULL) .Call("RC_get_range_slices", conn, k.start, k.end, c.family, first, last, limit, reverse, k.limit, tokens, fixed, comparator, validator, PACKAGE="RCassandra")
 
-RC.insert <- function(conn, c.family, key, column, value=NULL) .Call("RC_insert", conn, key, c.family, column, value, PACKAGE="RCassandra")
+RC.insert <- function(conn, c.family, key, column, value=NULL, comparator=NULL, validator=NULL) .Call("RC_insert", conn, key, c.family, column, value, comparator, validator, PACKAGE="RCassandra")
 
 RC.mutate <- function(conn, mutation) .Call("RC_mutate", conn, mutation)
 

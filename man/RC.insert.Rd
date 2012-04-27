@@ -11,7 +11,8 @@
   families and columns/values.
 }
 \usage{
-RC.insert(conn, c.family, key, column, value = NULL)
+RC.insert(conn, c.family, key, column, value = NULL,
+          comparator = NULL, validator = NULL)
 RC.mutate(conn, mutation)
 }
 \arguments{
@@ -21,6 +22,10 @@ RC.mutate(conn, mutation)
   \item{column}{column name (string) }
   \item{value}{optinally a value to add into the column. If \code{NULL}
     only the column is created}
+  \item{comparator}{comparator (column name type) to be used - see
+    \code{\link{RC.get}} for details}
+  \item{validator}{validator (value type) to be used - see
+  \code{\link{RC.get}} for details}
   \item{mutation}{a structure describing the desired mutation (see
     Cassandra documentation). In its simplest form it is a nested list:
     \code{list(row.key1=list(c.family1=list(col1=val1, ...), ...), ...)}
@@ -41,8 +46,12 @@ RC.mutate(conn, mutation)
   Cassandra requires timestamps on all objects that specify
   columns/values for conflict resolution. All functions above generate
   such timestamps from the system time as POSIX time in milliseconds.
+
+  \code{RC.mutate} currently only uses "UTF8Type" validator and
+  comparator as there is no way to specify either in the mutation
+  object.
 }
 \seealso{
-  \code{\link{RC.connect}}, \code{\link{RC.use}}
+  \code{\link{RC.connect}}, \code{\link{RC.use}}, \code{\link{RC.get}}
 }
 \keyword{interface}

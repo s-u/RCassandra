@@ -323,6 +323,19 @@ static const char *tc_read_str(tconn_t *c) {
     return 0;
 }
 
+static const char *tc_read_strn(tconn_t *c, int *outLen) {
+    int len = tc_read_i32(c);
+    if (outLen) *outLen = len;
+    if (tc_ok(c) && tc_read(c, len) == len) {
+	if (tc_ok(c)) {
+	    c->next_char = c->recv_buf[len];
+	    c->recv_buf[len] = 0; /* read guarantees that an extra byte is available */
+	    return (const char*) c->recv_buf;
+	}
+    }
+    return 0;
+}
+
 /* -- Thrift protocol building blocks -- */
 
 enum {
@@ -386,6 +399,12 @@ static void tc_write_i64(tconn_t *c, int64_t i) {
     c->send_buf[c->send_len++] = (i >> 16) & 255;
     c->send_buf[c->send_len++] = (i >> 8) & 255;
     c->send_buf[c->send_len++] = i & 255;    
+}
+
+static void tc_write_double(tconn_t *c, double d) {
+    int64_t i;
+    memcpy(&i, &d, sizeof(d));
+    tc_write_i64(c, i);
 }
 
 static void tc_write_str(tconn_t *c, const char *s) {
@@ -845,27 +864,27 @@ SEXP RC_get(SEXP sc, SEXP key, SEXP cf, SEXP col) {
 typedef struct type_map {
     const char *name;
     SEXPTYPE  r_type;
-    int       size;
 } type_map_t;
 
 static const type_map_t type_map[] = {
 #define CT_UTF8  0
-    { "UTF8Type", STRSXP, 0 },
+    { "UTF8Type", STRSXP },
 #define CT_ASCII 1
-    { "AsciiType", STRSXP, 0 },
+    { "AsciiType", STRSXP },
 #define CT_BYTES 2
-    { "BytesType", STRSXP, 0 }, /* FIXME: this is not true */
-#define CT_CONVERT 3 /* below this are direct types */
+    { "BytesType", VECSXP },
 #define CT_LONG  3
-    { "LongType",  REALSXP, 8 },
+    { "LongType",  REALSXP },
 #define CT_DATE  4
-    { "DateType",  REALSXP, 8 },
+    { "DateType",  REALSXP },
 #define CT_BOOL  5
-    { "BooleanType", LGLSXP, 1 },
+    { "BooleanType", LGLSXP },
 #define CT_FLOAT 6
-    { "FloatType", REALSXP, 4 },
+    { "FloatType", REALSXP },
 #define CT_DOUBLE 7
-    { "DoubleType", REALSXP, 8 },
+    { "DoubleType", REALSXP },
+#define CT_UUID 8
+    { "UUIDType", STRSXP },
     { 0 }
 };
 
@@ -903,8 +922,19 @@ static double mem_double(const char *v) {
     return dv;
 }
 
-static void setTypedElement(SEXP v, int index, const char *val, int type) {
+static void setTypedElement(SEXP v, int index, const char *val, int len, int type) {
     switch (type) {
+    case CT_ASCII:
+    case CT_UTF8:
+	SET_STRING_ELT(v, index, mkCharCE(val, CE_UTF8));
+	break;
+    case CT_BYTES:
+	{
+	    SEXP rv = allocVector(RAWSXP, len);
+	    memcpy(RAW(rv), val, len);
+	    SET_VECTOR_ELT(v, index, rv);
+	    break;
+	}
     case CT_LONG:
     case CT_DATE:
 	REAL(v)[index] = (double) mem_i64(val); break;
@@ -926,7 +956,110 @@ static void setTypedElement(SEXP v, int index, const char *val, int type) {
     case CT_BOOL:
 	INTEGER(v)[index] = *val ? 1 : 0;
 	break;
+    case CT_UUID:
+	{
+	    const unsigned char *u = (const unsigned char*) val;
+	    char buf[40];
+	    snprintf(buf, sizeof(buf), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		     u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+	    SET_STRING_ELT(v, index, mkChar(buf));
+	    break;
+	}
     }
+}
+
+static void writeTypedValue(tconn_t *c, SEXP vec, int type) {
+    if (TYPEOF(vec) == RAWSXP) { /* write raw vectors as-is */
+	int n = LENGTH(vec);
+	tc_write_i32(c, n);
+	tc_write(c, RAW(vec), n);
+	return;
+    }
+    /* take care of 0-length values first ("" is valid as NULL value for all types) */
+    if (vec == R_NilValue ||
+	(TYPEOF(vec) == STRSXP && (LENGTH(vec) == 0 || (LENGTH(vec) > 0 && !*CHAR(STRING_ELT(vec, 0)))))) {
+	tc_write_i32(c, 0);
+	return;
+    }
+    switch (type) {
+    case CT_UTF8:
+    case CT_ASCII:
+    case CT_BYTES:
+	if (TYPEOF(vec) != STRSXP) {
+	    Rf_warning("Value for type '%s' in neither a string nor a raw vector, passing NULL", type_map[type].name);
+	    tc_write_i32(c, 0);
+	    return;
+	}
+	tc_write_str(c, R2UTF8(vec));
+	return;
+    case CT_DATE:
+    case CT_DOUBLE:
+	{
+	    double d = asReal(vec);
+	    tc_write_i32(c, 8);
+	    tc_write_double(c, d);
+	    return;
+	}
+    case CT_LONG:
+	{
+	    int64_t i = (int64_t) asReal(vec);
+	    tc_write_i32(c, 8);
+	    tc_write_i64(c, i);
+	    return;
+	}
+    case CT_BOOL:
+	tc_write_i32(c, 1);
+	tc_write_u8(c, asLogical(vec));
+	return;
+    case CT_FLOAT:
+	{
+	    float f = (float) asReal(vec);
+	    int i;
+	    memcpy(&i, &f, 4);
+	    tc_write_i32(c, 4);
+	    tc_write_i32(c, i);
+	    return;
+	}
+    case CT_UUID:
+	if (TYPEOF(vec) != STRSXP) {
+	    Rf_warning("Value for type '%s' in neither a string nor a raw vector, passing NULL", type_map[type].name);
+	    tc_write_i32(c, 0);
+	    return;
+	} else {
+	    unsigned char u[16];
+	    int i = 0, j = 0, v = 0;
+	    const char *val = CHAR(STRING_ELT(vec, 0));
+	    while (val[i] && j < 32) {
+		j++;
+		if (val[i] >= '0' && val[i] <= '9')
+		    v |= val[i] - '0';
+		else if (val[i] >= 'a' && val[i] <= 'f')
+		    v |= val[i] - 'a' + 10;
+		else if (val[i] >= 'A' && val[i] <= 'F')
+		    v |= val[i] - 'A' + 10;
+		else if (val[i] == '-')
+		    j--;
+		else {
+		    Rf_warning("'%s' is not a valid UUID, passing NULL", val);
+		    tc_write_i32(c, 0);
+		    return;
+		}
+		if ((j & 1) == 0) {
+		    u[(j - 1) >> 1] = v;
+		    v = 0;
+		} else v <<= 4;
+		i++;
+	    }
+	    j >>= 1;
+	    while (j < 16)
+		u[j++] = 0;
+	    tc_write_i32(c, 16);
+	    tc_write(c, u, 16);
+	    return;
+	}
+    }
+    Rf_warning("Invalid/unsupported type, passing NULL");
+    tc_write_i32(c, 0);
 }
 
 /* read list payload of a result -- either a data frame of R_NilValue
@@ -959,19 +1092,13 @@ static SEXP list_result(tconn_t *c, int fin_call, int comp_type, int val_type) {
 		    int pd = tc_read_i16(c);
 		    /* printf(" -- %d) type=%d, id=%d\n", i + 1, pt, pd); */
 		    if (pt == TType_STRING) {
-			const char *cc = tc_read_str(c);
+			int slen;
+			const char *cc = tc_read_strn(c, &slen);
 			if (cc) {
-			    if (pd == 1) { /* key */
-				if (comp_type < CT_CONVERT)
-				    SET_STRING_ELT(sk, i, mkCharCE(cc, CE_UTF8));
-				else
-				    setTypedElement(sk, i, cc, comp_type);
-			    } else if (pd == 2) { /* value */
-				if (val_type < CT_CONVERT)
-				    SET_STRING_ELT(sv, i, mkCharCE(cc, CE_UTF8));
-				else 
-				    setTypedElement(sv, i, cc, val_type);
-			    }
+			    if (pd == 1) /* key */
+				setTypedElement(sk, i, cc, slen, comp_type);
+			    else if (pd == 2) /* value */
+				setTypedElement(sv, i, cc, slen, val_type);
 			}
 		    } else if (pt == TType_I64) {
 			int64_t v = tc_read_i64(c);
@@ -1001,8 +1128,6 @@ SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit,
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
-    if (TYPEOF(first) != STRSXP || LENGTH(first) != 1) Rf_error("column must be a character vector of length one");
-    if (TYPEOF(last) != STRSXP || LENGTH(last) != 1) Rf_error("column must be a character vector of length one");
     if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
     if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
     if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
@@ -1021,8 +1146,10 @@ SEXP RC_get_range(SEXP sc, SEXP key, SEXP cf, SEXP first, SEXP last, SEXP limit,
     tc_write_field(c, TType_STRUCT, 3);
     /* SliceRange */
     tc_write_field(c, TType_STRUCT, 2);
-    tc_write_fstr(c, 1, R2UTF8(first));
-    tc_write_fstr(c, 2, R2UTF8(last));
+    tc_write_field(c, TType_STRING, 1);
+    writeTypedValue(c, first, comp_type);
+    tc_write_field(c, TType_STRING, 2);    
+    writeTypedValue(c, last, comp_type);
     tc_write_field(c, TType_BOOL, 3); tc_write_u8(c, (asInteger(rev) == 1) ? 1 : 0);
     tc_write_field(c, TType_I32, 4);  tc_write_i32(c, asInteger(limit));
     tc_write_stop(c); /* SR */
@@ -1111,8 +1238,6 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(keys) != STRSXP) Rf_error("keys must be a character vector");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
-    if (TYPEOF(first) != STRSXP || LENGTH(first) != 1) Rf_error("column must be a character vector of length one");
-    if (TYPEOF(last) != STRSXP || LENGTH(last) != 1) Rf_error("column must be a character vector of length one");
     if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
     if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
     if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
@@ -1133,8 +1258,10 @@ SEXP RC_mget_range(SEXP sc, SEXP keys, SEXP cf, SEXP first, SEXP last, SEXP limi
     tc_write_field(c, TType_STRUCT, 3);
     /* SliceRange */
     tc_write_field(c, TType_STRUCT, 2);
-    tc_write_fstr(c, 1, translateCharUTF8(STRING_ELT(first, 0)));
-    tc_write_fstr(c, 2, translateCharUTF8(STRING_ELT(last, 0)));
+    tc_write_field(c, TType_STRING, 1);
+    writeTypedValue(c, first, comp_type);
+    tc_write_field(c, TType_STRING, 2);    
+    writeTypedValue(c, last, comp_type);
     tc_write_field(c, TType_BOOL, 3); tc_write_u8(c, asInteger(rev) ? 1 : 0);
     tc_write_field(c, TType_I32, 4);  tc_write_i32(c, asInteger(limit));
     tc_write_stop(c); /* SR */
@@ -1188,8 +1315,6 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key_f) != STRSXP || TYPEOF(key_l) != STRSXP || LENGTH(key_f) != 1 || LENGTH(key_l) != 1) Rf_error("start/end key must be a character vector of length one");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
-    if (TYPEOF(first) != STRSXP || LENGTH(first) != 1) Rf_error("column must be a character vector of length one");
-    if (TYPEOF(last) != STRSXP || LENGTH(last) != 1) Rf_error("column must be a character vector of length one");
     if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
     if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
     if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
@@ -1206,8 +1331,10 @@ SEXP RC_get_range_slices(SEXP sc, SEXP key_f, SEXP key_l, SEXP cf, SEXP first, S
     tc_write_field(c, TType_STRUCT, 2);
     /* SliceRange */
     tc_write_field(c, TType_STRUCT, 2);
-    tc_write_fstr(c, 1, R2UTF8(first));
-    tc_write_fstr(c, 2, R2UTF8(last));
+    tc_write_field(c, TType_STRING, 1);
+    writeTypedValue(c, first, comp_type);
+    tc_write_field(c, TType_STRING, 2);    
+    writeTypedValue(c, last, comp_type);
     tc_write_field(c, TType_BOOL, 3); tc_write_u8(c, asInteger(rev) ? 1 : 0);
     tc_write_field(c, TType_I32, 4);  tc_write_i32(c, col_lim);
     tc_write_stop(c); /* SR */
@@ -1386,14 +1513,20 @@ static int64_t now() {
     return v;
 }
 
-SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val) {
+SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val, SEXP comp, SEXP valr) {
     msg_t m;
     tconn_t *c;
+    int comp_type = 0, val_type = 0;
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
-    if (TYPEOF(col) != STRSXP || LENGTH(col) != 1) Rf_error("column must be a character vector of length one");
     if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("value must be a character vector of length one or NULL");
+    if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
+    if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
+    if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
+    if (valr != R_NilValue && (TYPEOF(valr) != STRSXP || LENGTH(valr) != 1)) Rf_error("validator must be NULL or a string");
+    if (valr != R_NilValue) val_type = get_type(CHAR(STRING_ELT(valr, 0)));
+    if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
     c = (tconn_t*) EXTPTR_PTR(sc);
 
     tc_write_msg(c, "insert", TMessageType_CALL, c->seq++);
@@ -1404,8 +1537,12 @@ SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val) {
     tc_write_stop(c);
     /* Column */
     tc_write_field(c, TType_STRUCT, 3);
-    tc_write_fstr(c, 1, R2UTF8(col));
-    if (val != R_NilValue) tc_write_fstr(c, 2, R2UTF8(val));
+    tc_write_field(c, TType_STRING, 1);
+    writeTypedValue(c, col, comp_type);
+    if (val != R_NilValue) {
+	tc_write_field(c, TType_STRING, 2);
+	writeTypedValue(c, val, val_type);
+    }
     tc_write_field(c, TType_I64, 3); tc_write_i64(c, now());
     tc_write_stop(c); /* Col */
     /* consistency level */
@@ -1507,7 +1644,7 @@ SEXP RC_write_table(SEXP sc, SEXP cf, SEXP df, SEXP rn, SEXP cn) {
     msg_t m;
     tconn_t *c;
     int64_t now_ts;
-    int i, j, nc, nr, conv = 0;
+    int i, j, nc, nr = 0, conv = 0;
     const char *cfn;
 
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");

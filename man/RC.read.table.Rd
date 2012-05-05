@@ -64,6 +64,14 @@ RC.write.table(conn, c.family, df)
   to use \code{df <- df[order(as.integer(row.names(df))),]} on the
   result of \code{RC.read.table} for tables with automatic row names to
   obtain the original order of rows.
+
+  \code{RC.read.table} is more effcient than
+  \code{\link{RC.get.range.slices}} because it can store columns into
+  vectors and can pre-allocate the whole structure in advance.
+  
+  Note that the current implementation of tables (\code{RC.read.table}
+  and \code{RC.write.table}) supports only string-based representation
+  of columns and values ("UTF8Type",  "AsciiType" or similar).
 }
 \seealso{
   \code{\link{RC.connect}}, \code{\link{RC.use}}, \code{\link{RC.get}}

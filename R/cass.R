@@ -11,7 +11,7 @@ RC.use <- function(conn, keyspace, cache.def = TRUE) {
   invisible(res)
 }    
 
-RC.get <- function(conn, c.family, key, c.name, comparator=NULL, validator=NULL) .Call("RC_get", conn, key, c.family, c.name, comparator, validator, PACKAGE="RCassandra")
+RC.get <- function(conn, c.family, key, c.names, comparator=NULL, validator=NULL) .Call("RC_get_list", conn, key, c.family, c.names, length(c.names), 0, comparator, validator, PACKAGE="RCassandra")
 
 .current.comparator <- function(c.family) {
   if(!is.null(ks <- .keyspace.cache[["*current keyspace*"]])) {

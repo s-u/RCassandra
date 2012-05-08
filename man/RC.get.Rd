@@ -13,7 +13,7 @@
   subsequent operations. All functions described below require keyspace
   to be set using this function.
   
-  \code{RC.get} queries one key and one column
+  \code{RC.get} queries one key and a fixed list of columns
 
   \code{RC.get.range} queries one key and multiple columns
 
@@ -27,7 +27,7 @@
 }
 \usage{
 RC.use(conn, keyspace, cache.def = TRUE)
-RC.get(conn, c.family, key, c.name,
+RC.get(conn, c.family, key, c.names,
        comparator = NULL, validator = NULL)
 RC.get.range(conn, c.family, key, first = "", last = "",
              reverse = FALSE, limit = 1e+07,
@@ -76,11 +76,9 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
 \value{
   \code{RC.use} and \code{RC.consistency} returns \code{conn}
   
-  \code{RC.get} returns nothing useful at this point :P
-
-  \code{RC.get.range} returns a data frame with columns \code{key}
-  (column name), \code{value} (value in that column) and \code{ts}
-  (timestamp).
+  \code{RC.get} and  \code{RC.get.range} return a data frame with
+  columns \code{key} (column name), \code{value} (value in that column)
+  and \code{ts} (timestamp).
 
   \code{RC.mget.range} and  \code{RC.get.range.slices} return a named
   list of data frames as described in \code{RC.get.range} with names
@@ -97,7 +95,7 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
   \emph{key}. A query is performed by first finding out which row(s)
   will be fetched according to the key (\code{RC.get},
   \code{RC.get.range}), keys (\code{RC.mget.range}) or key range
-  (\code{RC.get.rnage.slices}), then selecting the columns of
+  (\code{RC.get.range.slices}), then selecting the columns of
   interest. Empty string (\code{""}) can be used to denote an
   unspecified range (so the default is to fetch all columns).
 

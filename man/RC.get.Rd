@@ -52,7 +52,7 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
     validators, see details section for more information.}
   \item{c.family}{column family (aka table) name}
   \item{key}{row key}
-  \item{c.name}{column name}
+  \item{c.names}{vector of column names}
   \item{comparator}{string, type of the column keys (comparator in
     Cassandra speak) or NULL to rely on cached schema definitions}
   \item{validator}{string, type of the values (validator in Cassandra
@@ -166,6 +166,21 @@ RC.consistency(conn, level = c("one", "quorum", "local.quorum",
 \seealso{
   \code{\link{RC.connect}}, \code{\link{RC.read.table}}, \code{\link{RC.write.table}}
 }
-%\examples{
-%}
+\examples{
+\dontrun{
+c <- RC.connect("cassandra-host")
+RC.use(c, "testdb")
+## you will have to use cassandra-cli to create the schema for the "iris" CF
+RC.write.table(c, "iris", iris)
+RC.get(c, "iris", "1", c("Sepal.Length", "Species"))
+RC.get.range(c, "iris", "1")
+## list of 150 data frames
+r <- RC.get.range.slices(c, "iris")
+## use limit=0 to obtain all row keys without pulling any data
+rk <- RC.get.range.slices(c, "iris", limit=0)
+y <- RC.read.table(c, "iris")
+y <- y[order(as.integer(row.names(y))),]
+RC.close(c)
+}
+}
 \keyword{interface}

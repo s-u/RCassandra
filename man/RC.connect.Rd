@@ -51,6 +51,13 @@ RC.login(conn, username = "default", password = "")
 }
 %\seealso{
 %}
-%\examples{
-%}
+\examples{
+\dontrun{
+c <- RC.connect("cassandra-host")
+RC.login(c, "foo", "bar")
+RC.cluster.name(c)
+RC.describe.keyspaces(c)
+RC.close(c)
+}
+}
 \keyword{interface}

@@ -49,7 +49,7 @@ RC.version <- function(conn) .Call("RC_version", conn, PACKAGE="RCassandra")
 
 RC.login <- function(conn, username="default", password="") .Call("RC_login", conn, username, password, PACKAGE="RCassandra")
 
-RC.write.table <- function(conn, c.family, df) .Call("RC_write_table", conn, df, row.names(df), names(df))
+RC.write.table <- function(conn, c.family, df) .Call("RC_write_table", conn, c.family, df, row.names(df), names(df), PACKAGE="RCassandra")
 
 RC.read.table <- function(conn, c.family, convert = TRUE, na.strings = "NA", as.is = FALSE, dec = ".") {
   df <- RC.get.range.slices(conn, c.family, fixed=TRUE)

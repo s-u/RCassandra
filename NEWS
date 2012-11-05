@@ -1,7 +1,7 @@
-0.1-1	(under development)
+0.1-1	2012-11-05
    o	RC.get() now performs get_slice with a list of columns
 
-   o	fix a bug in RC.write.table (tahnks to Pierre-Alexandre des
+   o	fix a bug in RC.write.table (thanks to Pierre-Alexandre des
 	Mazis for reporting)
 
    o	fix WSAStartup version request (Windows only)

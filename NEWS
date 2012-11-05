@@ -1,5 +1,11 @@
 0.1-1	(under development)
    o	RC.get() now performs get_slice with a list of columns
 
+   o	fix a bug in RC.write.table (tahnks to Pierre-Alexandre des
+	Mazis for reporting)
+
+   o	fix WSAStartup version request (Windows only)
+
+
 0.1-0	2012-05-05
    o	initial CRAN release

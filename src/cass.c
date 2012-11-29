@@ -1803,6 +1803,7 @@ SEXP RC_write_table(SEXP sc, SEXP cf, SEXP df, SEXP rn, SEXP cn) {
 	    tc_write_stop(c); /* Mut */
 	}
     }
+    if (conv) UNPROTECT(1);
     tc_write_stop(c);
     tc_flush(c);
 

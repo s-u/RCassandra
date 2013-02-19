@@ -1,4 +1,4 @@
-0.1-2	(under development)
+0.1-2	2013-02-19
    o	fix missing UNPROTECT() when using non-character columns in
 	RC.write.table()
 

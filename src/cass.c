@@ -20,8 +20,8 @@
 
 #include <sys/types.h>
 #ifdef WIN32
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 static int wsock_up = 0;
 #else
 #define closesocket(C) close(C)

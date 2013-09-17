@@ -2,10 +2,10 @@
 \alias{RC.insert}
 \alias{RC.mutate}
 \title{
-  Update function to insert data into Cassandra
+  Update functions to insert data into Cassandra
 }
 \description{
-  \code{RC.insert} updates or inserts a new column/value
+  \code{RC.insert} updates or inserts new column/value pairs
 
   \code{RC.mutate} batchwise updates or inserts a list of keys, column
   families and columns/values.
@@ -19,8 +19,9 @@ RC.mutate(conn, mutation)
   \item{conn}{connection handle obtained from \code{\link{RC.connect}}}
   \item{c.family}{name of the column family (string)}
   \item{key}{row key name (string) }
-  \item{column}{column name (string) }
-  \item{value}{optinally a value to add into the column. If \code{NULL}
+  \item{column}{column name - any vector supported by the comparator}
+  \item{value}{optinally values to add into the columns - if specified,
+    must be the same length as \code{column}. If \code{NULL}
     only the column is created}
   \item{comparator}{comparator (column name type) to be used - see
     \code{\link{RC.get}} for details}
@@ -34,6 +35,7 @@ RC.mutate(conn, mutation)
     \code{list(key=list(table=list(foo="bar")))}. The innermost list can
     optionally be a character vector (if unnamed it specifies the column
     names, otherwise names are column names and elements are values).
+    Only string keys and column names are supproted.
   }
 }
 \value{
@@ -43,13 +45,19 @@ RC.mutate(conn, mutation)
   Simon Urbanek
 }
 \note{
-  Cassandra requires timestamps on all objects that specify
-  columns/values for conflict resolution. All functions above generate
-  such timestamps from the system time as POSIX time in milliseconds.
+  \code{RC.insert} supports multi-column insertions where \code{column}
+  and \code{value} are vectors. For the scalar case \code{insert}
+  message is used, for vector case \code{batch_mutate}.
+  \code{RC.insert} honors both the validator and comparator (the latter
+  is taken from the cache if not specified).
 
   \code{RC.mutate} currently only uses "UTF8Type" validator and
   comparator as there is no way to specify either in the mutation
   object.
+
+  Cassandra requires timestamps on all objects that specify
+  columns/values for conflict resolution. All functions above generate
+  such timestamps from the system time as POSIX time in milliseconds.
 }
 \seealso{
   \code{\link{RC.connect}}, \code{\link{RC.use}}, \code{\link{RC.get}}

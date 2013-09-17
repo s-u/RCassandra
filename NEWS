@@ -1,6 +1,11 @@
 0.1-3	(under development)
    o	switch the order of winsock2.h and windows.h
 
+   o	add support for vector input in RC.insert() allowing
+	insertion of multiple columns. It uses batch_mutate
+	message and honors both the comparator and validator.
+
+
 0.1-2	2013-02-19
    o	fix missing UNPROTECT() when using non-character columns in
 	RC.write.table()

@@ -1112,7 +1112,7 @@ static void writeTypedValue(tconn_t *c, SEXP vec, int type) {
             tc_write_i32(c, i);
             return;
         }
-	    case CT_UUID:
+    case CT_UUID:
         if (TYPEOF(vec) != STRSXP) {
             Rf_warning("Value for type '%s' in neither a string nor a raw vector, passing NULL", type_map[type].name);
             tc_write_i32(c, 0);
@@ -1625,7 +1625,13 @@ SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val, SEXP comp, SEXP v
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
     if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
-    if (val != R_NilValue && (TYPEOF(val) != STRSXP || LENGTH(val) != 1)) Rf_error("value must be a character vector of length one or NULL");
+
+    if (col == R_NilValue || length(col) < 1) {
+	if (val != R_NilValue && length(val) > 0) Rf_error("zero-length column names are not allowed with one or more values");
+	return sc; /* zero-length insert = no-op */
+    }
+    if (val != R_NilValue && length(col) != length(val)) Rf_error("the column name and value vectors must have the same length");
+
     if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
     if (comp != R_NilValue) comp_type = get_type(CHAR(STRING_ELT(comp, 0)));
     if (comp_type < 0) Rf_error("Unsupported comparator '%s'", CHAR(STRING_ELT(comp, 0)));
@@ -1634,26 +1640,67 @@ SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val, SEXP comp, SEXP v
     if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
     c = (tconn_t*) EXTPTR_PTR(sc);
 
-    tc_write_msg(c, "insert", TMessageType_CALL, c->seq++);
-    tc_write_fstr(c, 1, R2UTF8(key)); /* key */
-    /* ColumnParent */
-    tc_write_field(c, TType_STRUCT, 2);
-    tc_write_fstr(c, 3, R2UTF8(cf));
-    tc_write_stop(c);
-    /* Column */
-    tc_write_field(c, TType_STRUCT, 3);
-    tc_write_field(c, TType_STRING, 1);
-    writeTypedValue(c, col, comp_type);
-    if (val != R_NilValue) {
-	tc_write_field(c, TType_STRING, 2);
-	writeTypedValue(c, val, val_type);
+    if (LENGTH(col) > 1) { /* for vector operations we must use mutation instead */
+	int i, n;
+	int64_t now_ts = now();
+	col = PROTECT(coerceToType(col, comp_type));
+	val = PROTECT(coerceToType(val, val_type));
+	n = LENGTH(col);
+	tc_write_msg(c, "batch_mutate", TMessageType_CALL, c->seq++);
+	/* batch_mutate(1:required map<binary, map<string, list<Mutation>>> mutation_map,
+	                2:required ConsistencyLevel consistency_level=ConsistencyLevel.ONE) */
+	tc_write_field(c, TType_MAP, 1); /* mutation */
+	tc_write_u8(c, TType_STRING);
+	tc_write_u8(c, TType_MAP);
+	tc_write_i32(c, 1); /* one row key */
+	tc_write_str(c, R2UTF8(key));
+	tc_write_u8(c, TType_STRING);
+	tc_write_u8(c, TType_LIST);
+	tc_write_i32(c, 1); /* one CF */
+	tc_write_str(c, R2UTF8(cf));
+	tc_write_u8(c, TType_STRUCT); /* Mutation */
+	tc_write_i32(c, n); /* n mutations */
+	for (i = 0; i < n; i++) {
+	    tc_write_field(c, TType_STRUCT, 1); /* CoSC */
+	    tc_write_field(c, TType_STRUCT, 1); /* Column */
+	    tc_write_field(c, TType_STRING, 1); /* - col name */
+	    writeTypedElement(c, col, i, comp_type);
+	    if (val != R_NilValue) {
+		tc_write_field(c, TType_STRING, 2); /* - value */
+		writeTypedElement(c, val, i, val_type);
+	    }
+	    tc_write_field(c, TType_I64, 3);    /* - ts */
+	    tc_write_i64(c, now_ts);
+	    tc_write_stop(c); /* Col */
+	    tc_write_stop(c); /* CoSC */
+	    tc_write_stop(c); /* Mut */
+	}
+	tc_write_field(c, TType_I32, 3); /* consistency level */
+	tc_write_i32(c, c->cl);
+	tc_write_stop(c); /* batch_mutate */
+	UNPROTECT(2);
+    } else {
+	tc_write_msg(c, "insert", TMessageType_CALL, c->seq++);
+	tc_write_fstr(c, 1, R2UTF8(key)); /* key */
+	/* ColumnParent */
+	tc_write_field(c, TType_STRUCT, 2);
+	tc_write_fstr(c, 3, R2UTF8(cf));
+	tc_write_stop(c);
+	/* Column */
+	tc_write_field(c, TType_STRUCT, 3);
+	tc_write_field(c, TType_STRING, 1);
+	writeTypedValue(c, col, comp_type);
+	if (val != R_NilValue) {
+	    tc_write_field(c, TType_STRING, 2);
+	    writeTypedValue(c, val, val_type);
+	}
+	tc_write_field(c, TType_I64, 3); tc_write_i64(c, now());
+	tc_write_stop(c); /* Col */
+	/* consistency level */
+	tc_write_field(c, TType_I32, 3);
+	tc_write_i32(c, c->cl);
+	tc_write_stop(c);
     }
-    tc_write_field(c, TType_I64, 3); tc_write_i64(c, now());
-    tc_write_stop(c); /* Col */
-    /* consistency level */
-    tc_write_field(c, TType_I32, 3);
-    tc_write_i32(c, c->cl);
-    tc_write_stop(c);
     tc_flush(c);
 
     if (tc_read_msg(c, &m)) {

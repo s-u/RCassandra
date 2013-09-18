@@ -1621,15 +1621,16 @@ static int64_t now() {
 SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val, SEXP comp, SEXP valr) {
     msg_t m;
     tconn_t *c;
-    int comp_type = 0, val_type = 0;
+    int comp_type = 0, val_type = 0, keys = 1;
     if (!inherits(sc, "CassandraConnection")) Rf_error("invalid connection");
-    if (TYPEOF(key) != STRSXP || LENGTH(key) != 1) Rf_error("key must be a character vector of length one");
+    if (TYPEOF(key) != STRSXP) Rf_error("key must be a character vector");
     if (TYPEOF(cf) != STRSXP || LENGTH(cf) != 1) Rf_error("column family must be a character vector of length one");
 
     if (col == R_NilValue || length(col) < 1) {
 	if (val != R_NilValue && length(val) > 0) Rf_error("zero-length column names are not allowed with one or more values");
 	return sc; /* zero-length insert = no-op */
     }
+    if (LENGTH(key) != 1 && length(col) != LENGTH(key)) Rf_error("key must be either a scalar or of the same length as column names");
     if (val != R_NilValue && length(col) != length(val)) Rf_error("the column name and value vectors must have the same length");
 
     if (comp != R_NilValue && (TYPEOF(comp) != STRSXP || LENGTH(comp) != 1)) Rf_error("comparator must be NULL or a string");
@@ -1640,40 +1641,56 @@ SEXP RC_insert(SEXP sc, SEXP key, SEXP cf, SEXP col, SEXP val, SEXP comp, SEXP v
     if (val_type < 0) Rf_error("Unsupported validator '%s'", CHAR(STRING_ELT(val, 0)));
     c = (tconn_t*) EXTPTR_PTR(sc);
 
+    if (LENGTH(key) > 1) { /* we have to count the number of keys to add to the mutation */
+	int i = 1, n = LENGTH(key);
+	while (i < n) {
+	    if (STRING_ELT(key, i) != STRING_ELT(key, i - 1)) keys++;
+	    i++;
+	}
+    }
+
     if (LENGTH(col) > 1) { /* for vector operations we must use mutation instead */
-	int i, n;
+	int i, row = 0, N;
 	int64_t now_ts = now();
 	col = PROTECT(coerceToType(col, comp_type));
 	val = PROTECT(coerceToType(val, val_type));
-	n = LENGTH(col);
 	tc_write_msg(c, "batch_mutate", TMessageType_CALL, c->seq++);
 	/* batch_mutate(1:required map<binary, map<string, list<Mutation>>> mutation_map,
 	                2:required ConsistencyLevel consistency_level=ConsistencyLevel.ONE) */
 	tc_write_field(c, TType_MAP, 1); /* mutation */
 	tc_write_u8(c, TType_STRING);
 	tc_write_u8(c, TType_MAP);
-	tc_write_i32(c, 1); /* one row key */
-	tc_write_str(c, R2UTF8(key));
-	tc_write_u8(c, TType_STRING);
-	tc_write_u8(c, TType_LIST);
-	tc_write_i32(c, 1); /* one CF */
-	tc_write_str(c, R2UTF8(cf));
-	tc_write_u8(c, TType_STRUCT); /* Mutation */
-	tc_write_i32(c, n); /* n mutations */
-	for (i = 0; i < n; i++) {
-	    tc_write_field(c, TType_STRUCT, 1); /* CoSC */
-	    tc_write_field(c, TType_STRUCT, 1); /* Column */
-	    tc_write_field(c, TType_STRING, 1); /* - col name */
-	    writeTypedElement(c, col, i, comp_type);
-	    if (val != R_NilValue) {
-		tc_write_field(c, TType_STRING, 2); /* - value */
-		writeTypedElement(c, val, i, val_type);
+	tc_write_i32(c, keys); /* # of keys */
+	N = LENGTH(col);
+	while (row < LENGTH(key)) {	    
+	    int n = N; /* number of columns to add for this key */
+	    tc_write_str(c, translateCharUTF8(STRING_ELT(key, row)));
+	    tc_write_u8(c, TType_STRING);
+	    tc_write_u8(c, TType_LIST);
+	    tc_write_i32(c, 1); /* one CF */
+	    tc_write_str(c, R2UTF8(cf));
+	    tc_write_u8(c, TType_STRUCT); /* Mutation */
+	    if (keys > 1) { /* if key is a vector, count contiguous entries we can fold */
+		n = 1;
+		while (n + row < N && STRING_ELT(key, n + row) == STRING_ELT(key, n + row - 1)) n++;
 	    }
-	    tc_write_field(c, TType_I64, 3);    /* - ts */
-	    tc_write_i64(c, now_ts);
-	    tc_write_stop(c); /* Col */
-	    tc_write_stop(c); /* CoSC */
-	    tc_write_stop(c); /* Mut */
+	    tc_write_i32(c, n); /* n mutations */
+	    for (i = 0; i < n; i++) {
+		tc_write_field(c, TType_STRUCT, 1); /* CoSC */
+		tc_write_field(c, TType_STRUCT, 1); /* Column */
+		tc_write_field(c, TType_STRING, 1); /* - col name */
+		writeTypedElement(c, col, row + i, comp_type);
+		if (val != R_NilValue) {
+		    tc_write_field(c, TType_STRING, 2); /* - value */
+		    writeTypedElement(c, val, row + i, val_type);
+		}
+		tc_write_field(c, TType_I64, 3);    /* - ts */
+		tc_write_i64(c, now_ts);
+		tc_write_stop(c); /* Col */
+		tc_write_stop(c); /* CoSC */
+		tc_write_stop(c); /* Mut */
+	    }
+	    row += n;
 	}
 	tc_write_field(c, TType_I32, 3); /* consistency level */
 	tc_write_i32(c, c->cl);
